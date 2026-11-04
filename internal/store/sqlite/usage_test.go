@@ -59,7 +59,7 @@ func TestRecordAndRecentUsage(t *testing.T) {
 func TestRecordUsageUnderLoad(t *testing.T) {
 	db := openTemp(t)
 	ctx := context.Background()
-	const n = 200
+	const n = 500
 	errs := make(chan error, n)
 	var wg sync.WaitGroup
 	for i := range n {

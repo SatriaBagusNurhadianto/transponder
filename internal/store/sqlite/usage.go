@@ -16,7 +16,7 @@ func (db *DB) RecordUsage(ctx context.Context, r store.UsageRecord) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.sql.ExecContext(ctx, `INSERT INTO usage
+	_, err = db.w.ExecContext(ctx, `INSERT INTO usage
 		(org_id, time, request_id, user, teams, key, project, route, provider, model, endpoint,
 		 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_nusd, estimated,
 		 status, latency_ms, fallbacks)

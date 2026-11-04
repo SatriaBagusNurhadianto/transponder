@@ -22,7 +22,7 @@ func (db *DB) CreateKey(ctx context.Context, k store.APIKey) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.sql.ExecContext(ctx, `INSERT INTO api_keys
+	_, err = db.w.ExecContext(ctx, `INSERT INTO api_keys
 		(org_id, name, hash, last4, role, teams, disabled, expires_at, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.OrgID, k.Name, k.Hash[:], k.Last4, k.Role, string(teams), k.Disabled,

@@ -72,7 +72,7 @@ func TestMigrateRollsBack(t *testing.T) {
 		"0002_good.sql": {Data: []byte("CREATE TABLE good (id INTEGER);")},
 		"0003_bad.sql":  {Data: []byte("CREATE TABLE half (id INTEGER); THIS IS NOT SQL;")},
 	}
-	err := migrate(context.Background(), db.sql, fsys)
+	err := migrate(context.Background(), db.w, fsys)
 	if err == nil || !strings.Contains(err.Error(), "0003_bad.sql") {
 		t.Fatalf("err = %v, want it to name 0003_bad.sql", err)
 	}
