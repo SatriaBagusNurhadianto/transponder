@@ -25,7 +25,7 @@ Planned in `docs/design.md` section 4. Packages marked (planned) do not exist ye
 
 - `cmd/transponder`: main, flags, bootstrap config, server start
 - `internal/config`: bootstrap YAML, env overrides, runtime config types and validation
-- `internal/auth` (planned): OIDC JWT verification, API keys, identity and roles
+- `internal/auth`: OIDC JWT verification, API keys, identity and roles
 - `internal/server` (planned): HTTP mux, middleware, gateway handlers
 - `internal/admin` (planned): `/admin/v1` handlers, pagination, audit writes
 - `internal/schema` (planned): canonical request, response, stream and usage types
