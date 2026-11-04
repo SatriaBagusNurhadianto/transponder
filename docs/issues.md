@@ -39,7 +39,7 @@ func Load(path string, environ []string) (*Bootstrap, error)
 - `path == ""` returns defaults: `listen_addr: ":8080"`, `store.sqlite: "./transponder.db"`, `log_level: "info"`.
 - `${VAR}` in the file is replaced from `environ` before parsing. A missing variable is an error that names it.
 - `TRANSPONDER_LISTEN_ADDR` overrides `listen_addr`; `__` separates nested keys, so `TRANSPONDER_STORE__SQLITE` overrides `store.sqlite`. Names are matched case-insensitively.
-- Unknown keys in the file or in `TRANSPONDER_` variables are an error, so typos do not pass silently.
+- Unknown keys in the file are an error, so typos do not pass silently. `TRANSPONDER_` variables that do not name a key are ignored, because Kubernetes injects `TRANSPONDER_PORT` and similar for a service called transponder.
 - Setting both `store.sqlite` and `store.postgres` is an error. `log_level` must be one of `debug`, `info`, `warn`, `error`.
 
 **Tests:** defaults with no file; a full file; `${VAR}` expansion and the missing-variable error; env override of a top-level and a nested key; unknown key in the file; unknown env key; both stores set; bad log level.

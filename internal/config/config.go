@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -37,6 +38,8 @@ type OTel struct {
 }
 
 // Load reads the file at path, which may be empty, and applies TRANSPONDER_ overrides from environ.
+// Variables that do not name a config key are ignored, since platforms such as Kubernetes inject
+// TRANSPONDER_PORT and similar for a service of the same name.
 func Load(path string, environ []string) (*Bootstrap, error) {
 	env := envMap(environ)
 	tree := map[string]any{}
@@ -56,9 +59,7 @@ func Load(path string, environ []string) (*Bootstrap, error) {
 			tree = map[string]any{}
 		}
 	}
-	if err := applyEnv(tree, environ); err != nil {
-		return nil, err
-	}
+	applyEnv(tree, environ)
 
 	c := &Bootstrap{ListenAddr: ":8080", LogLevel: "info"}
 	merged, err := yaml.Marshal(tree)
@@ -114,29 +115,45 @@ func expand(s string, env map[string]string) (string, error) {
 	return out, nil
 }
 
-func applyEnv(tree map[string]any, environ []string) error {
+func applyEnv(tree map[string]any, environ []string) {
+	known := leafPaths(reflect.TypeFor[Bootstrap](), "")
 	for _, kv := range environ {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok || len(k) <= len(envPrefix) || !strings.EqualFold(k[:len(envPrefix)], envPrefix) {
 			continue
 		}
-		path := strings.Split(strings.ToLower(k[len(envPrefix):]), "__")
+		name := strings.ToLower(k[len(envPrefix):])
+		if !known[name] {
+			continue
+		}
+		path := strings.Split(name, "__")
 		node := tree
 		for _, part := range path[:len(path)-1] {
-			next, exists := node[part]
-			if !exists {
-				child := map[string]any{}
-				node[part] = child
-				node = child
-				continue
-			}
-			child, isMap := next.(map[string]any)
+			child, isMap := node[part].(map[string]any)
 			if !isMap {
-				return fmt.Errorf("config: %s sets a key under %q, which is not a section", k, part)
+				child = map[string]any{}
+				node[part] = child
 			}
 			node = child
 		}
 		node[path[len(path)-1]] = v
 	}
-	return nil
+}
+
+func leafPaths(t reflect.Type, prefix string) map[string]bool {
+	out := map[string]bool{}
+	for f := range t.Fields() {
+		tag, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if f.Type.Kind() == reflect.Struct {
+			for p := range leafPaths(f.Type, prefix+tag+"__") {
+				out[p] = true
+			}
+			continue
+		}
+		out[prefix+tag] = true
+	}
+	return out
 }

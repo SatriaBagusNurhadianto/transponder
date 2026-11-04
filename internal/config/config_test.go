@@ -85,7 +85,6 @@ func TestLoadRejects(t *testing.T) {
 		path    string
 	}{
 		{name: "unknown file key", body: "listen_adr: x\n"},
-		{name: "unknown env key", environ: []string{"TRANSPONDER_NOPE=1"}},
 		{name: "both stores", body: "store:\n  sqlite: a.db\n  postgres: postgres://x\n"},
 		{name: "bad log level", body: "log_level: loud\n"},
 		{name: "missing file", path: filepath.Join(t.TempDir(), "nope.yaml")},
@@ -100,5 +99,23 @@ func TestLoadRejects(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestLoadIgnoresUnknownEnv(t *testing.T) {
+	environ := []string{
+		"TRANSPONDER_PORT=tcp://10.0.0.1:8080",
+		"TRANSPONDER_SERVICE_HOST=10.0.0.1",
+		"TRANSPONDER_PORT_8080_TCP_ADDR=10.0.0.1",
+		"TRANSPONDER_STORE=oops",
+		"TRANSPONDER_STORE__NOPE=1",
+		"TRANSPONDER_LOG_LEVEL=warn",
+	}
+	c, err := Load("", environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LogLevel != "warn" || c.Store.SQLite != "./transponder.db" {
+		t.Fatalf("config = %+v", c)
 	}
 }
