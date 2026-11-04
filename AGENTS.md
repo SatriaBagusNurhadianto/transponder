@@ -32,7 +32,7 @@ Planned in `docs/design.md` section 4. Packages marked (planned) do not exist ye
 - `internal/dialect/openai`, `internal/dialect/anthropic` (planned): wire formats and usage parsing
 - `internal/router` (planned): routes, access, fallback, cooldown
 - `internal/provider/<name>` (planned): one adapter per backend; `providertest` is the conformance suite
-- `internal/store`, `internal/store/sqlite` (planned): store interfaces, SQLite with embedded migrations
+- `internal/store`, `internal/store/sqlite`: store interfaces, SQLite with embedded migrations in `internal/store/sqlite/migrations`
 - `internal/pricing`, `internal/budget`, `internal/runtime`, `internal/secrets`, `internal/telemetry` (planned): prices, budgets, live config, sealed secrets, logs and metrics
 - `internal/testutil` (planned): shared fakes
 - `api/openapi.yaml` (planned): the admin API description
