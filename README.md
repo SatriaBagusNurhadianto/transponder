@@ -2,7 +2,7 @@
 
 An LLM gateway that knows who is spending what. One Go binary in front of Anthropic, OpenAI, Gemini and Ollama, with fallback across providers, cost per user from your own identity provider, and budgets that hold across replicas. Every feature is free.
 
-> **Status: in development.** Nothing here runs yet beyond `transponder --version`. The design is settled in [docs/design.md](docs/design.md) and the work is tracked in [issues](https://github.com/raven-clown/transponder/issues). Star or watch the repository to follow along, and see [How to help](#how-to-help) if you want to build it with us.
+> **Status: in development.** Milestone 1 is done: the binary starts with no config, prints an admin key and answers chat completions through a built-in test provider. Real providers come next. The design is settled in [docs/design.md](docs/design.md) and the work is tracked in [issues](https://github.com/raven-clown/transponder/issues). Star or watch the repository to follow along, and see [How to help](#how-to-help) if you want to build it with us.
 
 ## What it does
 

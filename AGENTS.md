@@ -17,6 +17,13 @@ golangci-lint run ./...
 make check   # lint plus tests with the 80% coverage check
 ```
 
+Run the gateway locally (SQLite in the working directory, admin key on stderr):
+
+```shell
+go run ./cmd/transponder
+go run ./cmd/transponder --config transponder.yaml
+```
+
 On Windows without gcc, `-race` is not available: run `go test ./...` locally and let CI run the race detector.
 
 ## Layout
