@@ -1,0 +1,142 @@
+// Package config loads the bootstrap settings transponder needs before it can reach its database.
+package config
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"go.yaml.in/yaml/v3"
+)
+
+const envPrefix = "TRANSPONDER_"
+
+// Bootstrap holds the settings read from the YAML file and the environment.
+type Bootstrap struct {
+	ListenAddr string `yaml:"listen_addr"`
+	Store      Store  `yaml:"store"`
+	SecretsKey string `yaml:"secrets_key"`
+	OTel       OTel   `yaml:"otel"`
+	LogLevel   string `yaml:"log_level"`
+}
+
+// Store selects the database. Exactly one of the fields is set.
+type Store struct {
+	SQLite   string `yaml:"sqlite"`
+	Postgres string `yaml:"postgres"`
+}
+
+// OTel configures trace export.
+type OTel struct {
+	Endpoint string `yaml:"endpoint"`
+}
+
+// Load reads the file at path, which may be empty, and applies TRANSPONDER_ overrides from environ.
+func Load(path string, environ []string) (*Bootstrap, error) {
+	env := envMap(environ)
+	tree := map[string]any{}
+	if path != "" {
+		raw, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return nil, fmt.Errorf("reading config: %w", err)
+		}
+		expanded, err := expand(string(raw), env)
+		if err != nil {
+			return nil, err
+		}
+		if err := yaml.Unmarshal([]byte(expanded), &tree); err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", path, err)
+		}
+		if tree == nil {
+			tree = map[string]any{}
+		}
+	}
+	if err := applyEnv(tree, environ); err != nil {
+		return nil, err
+	}
+
+	c := &Bootstrap{ListenAddr: ":8080", LogLevel: "info"}
+	merged, err := yaml.Marshal(tree)
+	if err != nil {
+		return nil, fmt.Errorf("encoding config: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(merged))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if c.Store.SQLite == "" && c.Store.Postgres == "" {
+		c.Store.SQLite = "./transponder.db"
+	}
+	return c, c.validate()
+}
+
+func (c *Bootstrap) validate() error {
+	if c.Store.SQLite != "" && c.Store.Postgres != "" {
+		return errors.New("config: set only one of store.sqlite and store.postgres")
+	}
+	switch strings.ToLower(c.LogLevel) {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("config: log_level %q must be debug, info, warn or error", c.LogLevel)
+	}
+	return nil
+}
+
+func envMap(environ []string) map[string]string {
+	m := make(map[string]string, len(environ))
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+func expand(s string, env map[string]string) (string, error) {
+	var missing []string
+	out := os.Expand(s, func(name string) string {
+		v, ok := env[name]
+		if !ok {
+			missing = append(missing, name)
+		}
+		return v
+	})
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return "", fmt.Errorf("config: environment variables not set: %s", strings.Join(missing, ", "))
+	}
+	return out, nil
+}
+
+func applyEnv(tree map[string]any, environ []string) error {
+	for _, kv := range environ {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || len(k) <= len(envPrefix) || !strings.EqualFold(k[:len(envPrefix)], envPrefix) {
+			continue
+		}
+		path := strings.Split(strings.ToLower(k[len(envPrefix):]), "__")
+		node := tree
+		for _, part := range path[:len(path)-1] {
+			next, exists := node[part]
+			if !exists {
+				child := map[string]any{}
+				node[part] = child
+				node = child
+				continue
+			}
+			child, isMap := next.(map[string]any)
+			if !isMap {
+				return fmt.Errorf("config: %s sets a key under %q, which is not a section", k, part)
+			}
+			node = child
+		}
+		node[path[len(path)-1]] = v
+	}
+	return nil
+}

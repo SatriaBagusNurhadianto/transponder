@@ -21,20 +21,21 @@ On Windows without gcc, `-race` is not available: run `go test ./...` locally an
 
 ## Layout
 
-Planned in `docs/design.md` section 4. Only `cmd/transponder` exists so far; update this list as packages land.
+Planned in `docs/design.md` section 4. Packages marked (planned) do not exist yet; update this list as packages land.
 
 - `cmd/transponder`: main, flags, bootstrap config, server start
 - `internal/config`: bootstrap YAML, env overrides, runtime config types and validation
-- `internal/auth`: OIDC JWT verification, API keys, identity and roles
-- `internal/server`: HTTP mux, middleware, gateway handlers
-- `internal/admin`: `/admin/v1` handlers, pagination, audit writes
-- `internal/schema`: canonical request, response, stream and usage types
-- `internal/dialect/openai`, `internal/dialect/anthropic`: wire formats and usage parsing
-- `internal/router`: routes, access, fallback, cooldown
-- `internal/provider/<name>`: one adapter per backend; `providertest` is the conformance suite
-- `internal/pricing`, `internal/budget`, `internal/runtime`, `internal/secrets`, `internal/store`, `internal/telemetry`
-- `internal/testutil`: shared fakes
-- `api/openapi.yaml`: the admin API description
+- `internal/auth` (planned): OIDC JWT verification, API keys, identity and roles
+- `internal/server` (planned): HTTP mux, middleware, gateway handlers
+- `internal/admin` (planned): `/admin/v1` handlers, pagination, audit writes
+- `internal/schema` (planned): canonical request, response, stream and usage types
+- `internal/dialect/openai`, `internal/dialect/anthropic` (planned): wire formats and usage parsing
+- `internal/router` (planned): routes, access, fallback, cooldown
+- `internal/provider/<name>` (planned): one adapter per backend; `providertest` is the conformance suite
+- `internal/store`, `internal/store/sqlite` (planned): store interfaces, SQLite with embedded migrations
+- `internal/pricing`, `internal/budget`, `internal/runtime`, `internal/secrets`, `internal/telemetry` (planned): prices, budgets, live config, sealed secrets, logs and metrics
+- `internal/testutil` (planned): shared fakes
+- `api/openapi.yaml` (planned): the admin API description
 
 ## Rules
 
