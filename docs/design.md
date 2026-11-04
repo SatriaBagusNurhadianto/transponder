@@ -1,8 +1,8 @@
 # transponder design
 
-Status: draft for review, revision 3
+Status: approved, revision 4
 Date: 2026-11-04
-Contract: `mothership/CONTRACT.md` as of commit 5fb211e
+Contract: `mothership/CONTRACT.md` as of commit 1ed968a
 
 ## 1. What it is
 
@@ -233,6 +233,8 @@ routes:
 - `allow` lists who may use the route: `user:<id>`, `team:<name>` or `key:<name>`. Empty means every authenticated caller. A caller outside the list gets 403 `route_forbidden`. This is the "give someone access" task in the console.
 - With the `allow_direct` setting, `provider/model` (for example `local/llama3.2`) goes straight to that provider with no fallback. Only admins may use it when any route has a non-empty `allow`, so direct calls cannot get around access rules.
 - No match gives 404 `model_not_found`.
+- Route names are stable aliases, as the contract says. Other projects ask for a role, such as logbook's `memory-extract`, and the admin decides which provider serves it. Renaming a route through the admin API is allowed but logged in the audit as a breaking change.
+- `X-Project`, when present, is stored on the usage record so spend can be grouped by project. It does not change routing in v1.
 
 A target is retried on the next one when the call fails with a connection error, a timeout, 408, 429, any 5xx, Anthropic's 529, or 401 and 403 from the upstream (that means transponder's provider key is bad, which is not the caller's fault). It is not retried on other 4xx: a bad request stays bad on every provider.
 
@@ -261,7 +263,7 @@ OIDC settings: issuer, audience, `user_claim` (default `sub`), `teams_claim` (op
 
 API keys are created through the admin API (or declared in YAML). A key looks like `tp_` followed by 32 random bytes in base64url. It is shown once when created; the database keeps only its SHA-256 hash and the last four characters for display. Each key has a name, teams, a role, an optional expiry, and can be disabled. For a key, `User` is the key name.
 
-First start: if the database has no admin key and no OIDC admin mapping, transponder creates an admin key and prints it once to the log, the way Grafana and Jenkins do it. With that key the console, or curl, can do the rest.
+First start: if the database has no admin key and no OIDC admin mapping, transponder creates an admin key and prints it once to stderr, the way Grafana and Jenkins do it, as the contract requires. With that key the console, or curl, can do the rest.
 
 Provider secrets: provider API keys created through the admin API are sealed with AES-256-GCM before they are written. The 32-byte key comes from `secrets_key` in the bootstrap config or `TRANSPONDER_SECRETS_KEY`. When neither is set and the store is SQLite, transponder generates one into `transponder.key` next to the database with 0600 permissions, so a single binary still needs no setup. With Postgres the key must be set explicitly, and every replica gets the same one. Secrets are write-only through the API: reads return `"set": true` and the last four characters.
 
@@ -282,7 +284,7 @@ otel:
 log_level: info
 ```
 
-Any key can be overridden by environment variable, nested keys joined by `_`: `TRANSPONDER_LISTEN_ADDR`, `TRANSPONDER_STORE_POSTGRES`.
+Any key can be overridden by environment variable, with `__` between nested keys as the contract says: `TRANSPONDER_LISTEN_ADDR` for `listen_addr`, `TRANSPONDER_STORE__POSTGRES` for `store.postgres`.
 
 The same file may also contain `providers`, `routes`, `budgets`, `keys`, `prices` and `settings`. At start, transponder upserts those into SQL and marks them `source: file`. Items marked that way show up in the admin API like any other but cannot be changed or deleted there (409 `managed_by_file`), so a GitOps setup and the console never fight over the same item. Items created through the API are `source: api`. Removing an item from the file and restarting deletes it. A user who never writes YAML never sees any of this.
 
@@ -357,7 +359,7 @@ Endpoints:
 | Budgets | `GET /budgets`, `POST /budgets`, `GET/PATCH/DELETE /budgets/{id}`, `GET /budgets/status?subject=` (spend, limit, reset time) |
 | Keys | `GET /keys`, `POST /keys` (returns the secret once), `GET/PATCH/DELETE /keys/{name}`, `POST /keys/{name}/rotate` |
 | Prices | `GET /prices` (embedded and overrides, marked), `PUT /prices/{type}/{model}`, `DELETE /prices/{type}/{model}` |
-| Usage | `GET /usage?group_by=user|team|key|model|provider|day&from=&to=&user=&team=` (totals), `GET /requests` (single usage records, newest first, cursor paginated) |
+| Usage | `GET /usage?group_by=user|team|key|project|model|provider|day&from=&to=&user=&team=&project=` (totals), `GET /requests` (single usage records, newest first, cursor paginated) |
 | Audit | `GET /audit?actor=&resource=&from=&to=` (cursor paginated) |
 
 Deleting a provider that a route still uses is 409 `in_use` with the route ids, so the console can say what to fix.
@@ -373,10 +375,10 @@ The `Store` interface is split by concern (`UsageStore`, `ConfigStore`, `AuditSt
 
 Tables:
 
-- `usage`: id, time, request_id, user, teams, key, route, provider, model, endpoint, input, output, cache_read, cache_write, cost_nusd, estimated, status, latency_ms, fallbacks.
-- `spend`: subject, period, period_start, cost_nusd, primary key on the first three. Updated with `INSERT ... ON CONFLICT DO UPDATE SET cost_nusd = spend.cost_nusd + excluded.cost_nusd`, which both databases support, so concurrent replicas never lose an update.
-- `providers`, `routes`, `route_targets`, `budgets`, `api_keys`, `prices`, `settings`: runtime config, each with `version`, `source`, `created_at`, `updated_at`.
-- `audit`: id, time, actor (user and key), action, resource kind and id, a JSON diff of the change with secrets replaced by `"***"`, request id.
+- `usage`: id, org_id, time, request_id, user, teams, key, project, route, provider, model, endpoint, input, output, cache_read, cache_write, cost_nusd, estimated, status, latency_ms, fallbacks.
+- `spend`: org_id, subject, period, period_start, cost_nusd, primary key on the first four. Updated with `INSERT ... ON CONFLICT DO UPDATE SET cost_nusd = spend.cost_nusd + excluded.cost_nusd`, which both databases support, so concurrent replicas never lose an update.
+- `providers`, `routes`, `route_targets`, `budgets`, `api_keys`, `prices`, `settings`: runtime config, each with `org_id`, `version`, `source`, `created_at`, `updated_at`.
+- `audit`: id, org_id, time, actor (user and key), action, resource kind and id, a JSON diff of the change with secrets replaced by `"***"`, request id.
 - `config_version`: one row.
 - `schema_migrations`: applied migration numbers.
 
@@ -384,11 +386,11 @@ Spend rows are kept for every user, team and key, budgeted or not, so adding a b
 
 ## 13. Operations and contract fit
 
-- `transponder --config transponder.yaml`. With no `--config` it starts with defaults: SQLite in the working directory, `:8080`, a generated secrets key and a printed admin key.
+- `transponder --config transponder.yaml`. With no `--config` it starts with defaults: SQLite in the working directory, `:8080`, a generated secrets key and a one-time admin key printed to stderr.
 - `/healthz` is always 200 while the process runs. `/readyz` checks the store and, when OIDC is configured, that the JWKS has been fetched. Providers are left out of readiness on purpose: one provider down is what fallback is for.
 - `/metrics`: `transponder_requests_total{endpoint,route,provider,model,status}`, `transponder_tokens_total{direction,provider,model}`, `transponder_cost_usd_total{provider,model}`, `transponder_upstream_duration_seconds{provider,model}`, `transponder_fallbacks_total{route,from,to,reason}`, `transponder_budget_rejections_total{subject_kind}`, `transponder_unpriced_requests_total`, `transponder_config_reloads_total{result}`. No user label, to keep cardinality bounded; per-user numbers live in SQL.
 - Tracing over OTLP when `otel.endpoint` is set: one span per request, one child span per upstream attempt, with provider, model, tokens and cost as attributes.
-- Logs: JSON on stdout through `log/slog`, one line per request with id, user, route, provider, model, tokens, cost, status, latency and fallbacks. Prompts and completions are never logged.
+- Logs: JSON on stdout through `log/slog`, one line per request with id, user, project, route, provider, model, tokens, cost, status, latency and fallbacks. Prompts and completions are never logged.
 - `GET /v1/models` lists the literal route names the caller may use and, for admins, direct `provider/model` entries, so tools such as Open WebUI can show a model picker.
 - `POST /v1/messages/count_tokens` is forwarded to the first Anthropic target of the route, and returns 404 when the route has none.
 - Releases: GoReleaser builds static binaries for Linux, macOS and Windows on amd64 and arm64, and a distroless container image.
@@ -408,13 +410,7 @@ Spend rows are kept for every user, team and key, budgeted or not, so adding a b
 | Shared repository files, `make check`, merge rules, commit and push after every change | Section 15 |
 | `github.com/raven-clown/transponder`, Apache-2.0, Go 1.26+ | `go 1.26` in go.mod |
 
-Contract changes to agree:
-
-1. Streaming usage. The contract puts usage in response headers, which a streaming response sends before any tokens exist. Proposal: for streamed responses the same three names are sent as HTTP trailers, and clients that cannot read trailers take the counts from the stream's own usage event. rosetta and logbook should read trailers when they stream.
-2. `x-api-key`. Accepting it next to `Authorization: Bearer` is an addition only transponder needs; worth one line in the contract so airlock does not copy it by accident.
-3. The `echo` provider. The mothership e2e test can run transponder with `type: echo` and no real keys, so CI needs no secrets. Worth naming in the contract's e2e section.
-4. Shared admin conventions. The contract fixes the path, OpenAPI and cursors. The four projects would look like one product in the console if they also shared the error shape, the `If-Match` version check, the role names (`member`, `viewer`, `admin`), the `/admin/v1/status` and `/admin/v1/audit` endpoints, and the "file-managed items are read-only" rule. Section 11 is a proposal for all of them.
-5. First-start admin key. Printing a one-time admin key when nothing is configured is how this spec meets "no YAML to get started". The other projects need the same answer, so it may belong in the contract.
+The five contract changes this spec proposed (usage trailers on streams, `x-api-key` for transponder only, the `echo` provider, shared admin conventions, the first-start admin key) were agreed and are in the contract at 1ed968a, along with `org_id` on every table, `__` for nested env keys, and route names as stable aliases.
 
 ## 14. Decisions made, and open choices
 
@@ -436,48 +432,10 @@ Decided here, with the reason:
 - Everything under `internal/` for v1.
 - Gemini through the API key endpoint only; Vertex later.
 
-Open, for the user to decide (my lean in brackets):
+Settled on 2026-11-04, after the spec review:
 
-1. Make `provider` a public package in v1 so adapters can live out of tree and transponder can be embedded as a Go library. [Later. Keep it internal until the interface has had real contributors.]
-2. Unpriced models when a budget applies: serve at zero cost, or reject. [Serve, warn, count. Rejecting breaks Ollama users who forget to add a zero price.]
-3. Budget status code: 402 or 429. [402.]
-4. Multi-tenancy (separate organisations with their own providers, keys and budgets in one instance). The contract lists it as free, and litellm charges for it, so it is a selling point. It touches every table and query. [Put an `org_id` column on every runtime and usage table in v1, always `default`, with every query filtered by it. Ship the organisation endpoints and org admins in the release after v1. That keeps v1 small and avoids a data migration later.]
-5. Next features after v1, in order. [OpenAI Responses API (Codex CLI uses it), request-per-minute limits per user, Bedrock and Vertex adapters, exact-match caching, `LISTEN/NOTIFY` reload.]
-
-## 15. Testing and CI
-
-Test-driven throughout, following the shared CONTRIBUTING rules. CI runs on every pull request: `test` on Linux, macOS and Windows (with `-race` except on Windows), `coverage` at 80% or more, `lint` with golangci-lint, CodeQL, dependency review and a Conventional Commits title check. `make check` runs lint and coverage locally. The Windows dev machine has no gcc and no make, so local runs use `go test ./...` and `golangci-lint run ./...` directly and CI covers the race detector.
-
-- dialect packages: golden JSON and SSE fixtures for decode, encode and usage parsing in both directions.
-- provider packages: `providertest` conformance against `httptest` servers that replay recorded provider responses. No network in unit tests.
-- router: fake providers from `internal/testutil` that fail on cue, covering every fallback trigger, the non-retry cases, cooldown, access lists, and the first-byte rule for streams.
-- budget and store: SQLite in a temp dir always. Postgres tests sit behind the `integration` build tag and run in CI with a Postgres service container. A concurrency test fires parallel `Record` calls and checks the spend total is exact.
-- runtime reload: a write on one store handle shows up in a second runtime reading the same database, without sleeps (polling with a deadline).
-- admin API: table tests per endpoint for roles, validation errors, `If-Match` conflicts, `managed_by_file`, `in_use`, cursor pagination across pages, audit rows written, secrets never returned. The OpenAPI drift test from section 11.
-- server: end-to-end through `httptest.Server` with the echo provider: first-start admin key, creating a provider and route through the admin API, calling the gateway, headers, trailers, budgets, `/v1/usage`, health endpoints.
-- Live smoke tests behind a `live` build tag, run by hand with real keys before a release.
-
-The repository root holds the shared files from mothership's `contributing/`: CONTRIBUTING, AGENTS.md (with CLAUDE.md, GEMINI.md and `.github/copilot-instructions.md` pointing to it), SECURITY, CODE_OF_CONDUCT, CHANGELOG, LICENSE, issue and pull request templates, CODEOWNERS, the CI workflows, Dependabot, `.golangci.yml`, `.testcoverage.yml`, the Makefile and `.gitattributes`. CONTRIBUTING gets a "Writing a provider adapter" section. Every change is its own commit with a Conventional Commits message, AGENTS.md is updated in the same commit when commands, layout or rules change, and commits are pushed once the GitHub repository exists. `main` only changes through squash-merged pull requests with every check green. After this spec is approved, milestone 1 is drafted as issues in `docs/issues.md`, in the format of `contributing/labels.md`, with a few `good first issue` items, for review before anything is posted.
-
-## 16. Demo
-
-`examples/demo/` holds a compose file with transponder and Ollama. No config file.
-
-1. Start it, copy the admin key from the log, and with three curl calls to the admin API add an Anthropic provider, an Ollama provider and a `claude-*` route that falls back from one to the other. Then create two keys, `alice` and `bob`, and give bob a $0.01 monthly budget.
-2. Point Claude Code at transponder: `ANTHROPIC_BASE_URL=http://localhost:8080 ANTHROPIC_AUTH_TOKEN=<alice key> claude`. It works unchanged, and every reply has cost headers.
-3. `PATCH` the Anthropic provider with a broken key. Without a restart, the same session keeps answering from the local Ollama model, and `X-Transponder-Fallbacks: 1` shows it. `GET /admin/v1/audit` shows who changed the key.
-4. Run the OpenAI Python SDK as bob until the budget runs out and see the 402 with the reset time.
-5. `GET /admin/v1/usage?group_by=user` to see spend per user and model.
-6. Run two transponder replicas on one Postgres and show bob's budget holding across both, and a route change on one replica taking effect on the other.
-
-## 17. Milestones
-
-1. Skeleton: bootstrap config, store with migrations on SQLite, API keys and first-start admin key, the echo provider, `/v1/chat/completions` end to end with usage headers, `make check` and CI.
-2. OpenAI and Ollama adapters, native passthrough, streaming with trailers, embeddings.
-3. Anthropic dialect and adapter, translation both ways, Claude Code working.
-4. Router with fallback, cooldown and access lists; Gemini adapter.
-5. Budgets, `/v1/usage`, Postgres store.
-6. Admin API with OpenAPI, audit log, runtime reload, sealed secrets, YAML import as `source: file`.
-7. Metrics, tracing, demo, README, adapter guide, GoReleaser, first release.
-
-This is bigger than revision 1 by about one milestone, almost all of it the admin API. It still fits one implementation plan, and the plan breaks each milestone into test-first steps.
+- `provider` stays internal in v1. It becomes public once the interface has had real contributors.
+- Unpriced models are served at zero cost, logged as `unpriced` and counted in a metric.
+- Budget rejections use 402.
+- Every runtime and usage table has an `org_id` column, `default` in v1, and every query filters by it, as the contract requires. Organisation endpoints and org admins ship in the release after v1.
+- After v1, in this order: the OpenAI Responses API (Codex CLI uses it), request-per-minute limits per user, organisations, Bedrock and Vertex adapters, exact-match caching, `LISTEN/NOTIFY` reload.
