@@ -21,7 +21,7 @@ On Windows without gcc, `-race` is not available: run `go test ./...` locally an
 
 ## Layout
 
-Planned in `docs/design.md` section 4. No Go code exists yet; update this list as packages land.
+Planned in `docs/design.md` section 4. Only `cmd/transponder` exists so far; update this list as packages land.
 
 - `cmd/transponder`: main, flags, bootstrap config, server start
 - `internal/config`: bootstrap YAML, env overrides, runtime config types and validation
