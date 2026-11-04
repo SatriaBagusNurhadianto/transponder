@@ -1,0 +1,47 @@
+# AGENTS.md
+
+Instructions for coding agents working in this repository. Keep this file current: when a command, a package layout or a rule changes, update it in the same commit.
+
+## Project
+
+transponder is an LLM gateway in one Go binary. It serves OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` and Anthropic-compatible `/v1/messages` in front of Anthropic, OpenAI, Gemini and Ollama, falls back across providers, records usage and cost per user, and enforces budgets. Its configuration lives in SQL and is managed through a JSON admin API under `/admin/v1/`. It is used by teams that want per-user model spend and limits from their existing OIDC provider, and by the other mothership projects for chat and embeddings. The design is in `docs/design.md`.
+
+It is one of four projects described in the shared contract at https://github.com/raven-clown/mothership/blob/main/CONTRACT.md. Follow the contract. A change to how the projects connect goes to the contract first.
+
+## Commands
+
+```shell
+go build ./...
+go test -race ./...
+golangci-lint run ./...
+make check   # lint plus tests with the 80% coverage check
+```
+
+On Windows without gcc, `-race` is not available: run `go test ./...` locally and let CI run the race detector.
+
+## Layout
+
+Planned in `docs/design.md` section 4. No Go code exists yet; update this list as packages land.
+
+- `cmd/transponder`: main, flags, bootstrap config, server start
+- `internal/config`: bootstrap YAML, env overrides, runtime config types and validation
+- `internal/auth`: OIDC JWT verification, API keys, identity and roles
+- `internal/server`: HTTP mux, middleware, gateway handlers
+- `internal/admin`: `/admin/v1` handlers, pagination, audit writes
+- `internal/schema`: canonical request, response, stream and usage types
+- `internal/dialect/openai`, `internal/dialect/anthropic`: wire formats and usage parsing
+- `internal/router`: routes, access, fallback, cooldown
+- `internal/provider/<name>`: one adapter per backend; `providertest` is the conformance suite
+- `internal/pricing`, `internal/budget`, `internal/runtime`, `internal/secrets`, `internal/store`, `internal/telemetry`
+- `internal/testutil`: shared fakes
+- `api/openapi.yaml`: the admin API description
+
+## Rules
+
+- Follow CONTRIBUTING.md: tests with every change, a failing test first for a bug fix, table-driven tests, no network in unit tests, no bare `time.Sleep`.
+- Commit after every change, with a Conventional Commits message, and push it.
+- Never mention AI, assistants or code generation in code, comments, docs, commit messages, pull requests or issues.
+- Never add `Co-Authored-By`, `Generated with` or similar trailers.
+- No em-dashes. Keep comments short and about why.
+- Every feature ships in the free build. Never add a license check or a paid-only code path.
+- Update CHANGELOG.md under Unreleased for anything users will notice, and update README.md when usage changes.
