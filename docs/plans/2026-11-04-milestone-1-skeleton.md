@@ -19,7 +19,7 @@
 - The first-start admin key goes to stderr, never to the JSON log on stdout.
 - Usage headers: `X-Usage-Input-Tokens`, `X-Usage-Output-Tokens`, `X-Usage-Cost-USD` with six decimals.
 - Money is int64 nano-USD.
-- Doc comments on exported names only, short. No other comments unless the why is not obvious. No em-dashes. Never mention AI or assistants anywhere. No attribution trailers.
+- Doc comments on exported names only, short. No other comments unless the why is not obvious. No em-dashes. Follow the rules in AGENTS.md.
 - Each task ends with one Conventional Commits commit, pushed to `main` right away. Commits that finish an issue say `Closes #N` in the body. AGENTS.md layout is updated in the same commit when a package lands.
 - Local test command on this machine: `go test ./...` (no gcc, so no `-race`). Lint: `golangci-lint run ./...`. CI runs `-race`.
 
