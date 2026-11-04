@@ -1,8 +1,8 @@
 # transponder design
 
-Status: draft for review, revision 2
+Status: draft for review, revision 3
 Date: 2026-11-04
-Contract: `mothership/CONTRACT.md` as of commit 70d9603
+Contract: `mothership/CONTRACT.md` as of commit 5fb211e
 
 ## 1. What it is
 
@@ -18,19 +18,42 @@ Research done on 2026-11-04.
 - BerriAI/litellm: Python, about 63k stars, 100+ providers, the default choice for most teams.
 - agentgateway (Linux Foundation, Rust): LLM, MCP and A2A gateway aimed at Kubernetes. Budgets are written as rate limit policies counted in tokens or micro-dollars.
 
-What the open source editions leave out:
+What each one charges for. Only items read in their own docs on 2026-11-04 are listed; anything not verified is left out.
+
+bifrost Enterprise, from `docs/enterprise/overview.mdx` in maximhq/bifrost, which calls Enterprise "a strict superset of the open-source gateway":
+
+- Audit logs of configuration changes, and log exports
+- OIDC login with user and group sync (Okta, Entra, Keycloak, Zitadel, Google Workspace)
+- Role-based access control and data access control
+- Access profiles (reusable provider, model, budget and rate limit policies per user, role or team), projects, business units
+- Guardrails (PII, secrets detection, redaction)
+- Clustering, adaptive routing and the circuit breaker
+- Running several nodes on one database. Its budget docs say: "Running multiple OSS Bifrost nodes with a Postgres backend is not supported", and that this "is part of how we draw the OSS vs Enterprise line". OSS keeps budgets and usage in memory on one node.
+
+litellm Enterprise, from docs.litellm.ai/docs/enterprise and docs.litellm.ai/docs/proxy/token_auth:
+
+- JWT-based authentication ("JWT-based Auth requires a LiteLLM Enterprise license"), and with it per-user budgets mapped from a JWT claim
+- SSO beyond 5 users ("SSO is free for up to 5 users")
+- Audit logs with retention policies
+- Role-based access control, org and team admins
+- Multi-tenant architecture (organizations above teams)
+- Secret managers
+- Guardrails per key or team, and several built-in moderation callbacks
+
+Side by side:
 
 | | bifrost OSS | litellm OSS | agentgateway | transponder |
 |---|---|---|---|---|
-| OIDC / JWT callers | Enterprise (OIDC, SCIM, RBAC) | Enterprise ("JWT-based Auth requires a LiteLLM Enterprise license") | Yes | Yes |
-| Budget per user taken from the token | No, budgets hang off virtual keys | Through JWT-to-virtual-key mapping, Enterprise | Yes, as a rate limit expression | Yes, in USD, from a claim |
-| Several replicas sharing one budget | Not supported ("Running multiple OSS Bifrost nodes with a Postgres backend is not supported") | Yes, with Postgres and Redis | Needs a global rate limit service | Yes, with Postgres |
+| OIDC / JWT callers | Enterprise | Enterprise | Yes | Yes |
+| Budget per user taken from the token | No, budgets hang off virtual keys | Enterprise (JWT mapping) | Yes, as a rate limit expression | Yes, in USD, from a claim |
+| Several replicas sharing one budget | Enterprise | Yes, with Postgres and Redis | Needs a global rate limit service | Yes, with Postgres |
+| Roles for admins | Enterprise | Enterprise | Not checked | Yes |
 | Audit log of admin changes | Enterprise | Enterprise | Not checked | Yes |
-| Circuit breaker | Enterprise | Yes, deployment cooldowns | Not checked | Yes, simple cooldown |
-| Runs as | npx, Docker, Go SDK | Python service, Postgres, Redis | Kubernetes first | One static binary |
-| Size of one provider | bifrost's Anthropic package is over 1 MB of non-test Go source | Large Python modules | Rust | Target under 800 lines |
+| Circuit breaker | Enterprise | Not checked | Not checked | Yes, simple cooldown |
+| Runs as | npx, Docker, Go SDK | Python service with Postgres | Kubernetes first | One static binary |
+| Size of one provider | bifrost's Anthropic package is over 1 MB of non-test Go source | Not checked | Not checked | Target under 800 lines |
 
-So transponder is for a team that already has an identity provider and wants to know, for free, what each person spends on models and cap it, on one or several replicas, with one binary. That is a real gap: both popular gateways charge for exactly this. It is also a narrow one. Provider breadth and raw throughput stay bifrost's. The README should say so plainly, point people to bifrost when breadth is what they need, and say that every feature, including SSO, roles, the audit log, replicas and the admin API, is in the Apache-2.0 build with no paid edition.
+So transponder is for a team that already has an identity provider and wants to know, for free, what each person spends on models and cap it, on one or several replicas, with one binary, and manage it through a console without a sales call. Every row above that says Enterprise is free in transponder, and the contract rules out a paid edition for good. That is the clearest reason it exists. It is also a narrow one. Provider breadth and raw throughput stay bifrost's. The README should say so plainly, point people to bifrost when breadth is what they need, and lead with the fact that SSO, roles, the audit log, replicas and the admin API are all in the Apache-2.0 build.
 
 The second reason is the stack. A user who signs in once is the same user in rosetta, airlock, logbook and transponder, so an agent run, its tool calls, its memories and its model spend all line up under one identity and one `traceparent`, and one console manages all four.
 
@@ -382,7 +405,7 @@ Spend rows are kept for every user, team and key, budgeted or not, so adding a b
 | Everything is free | No license checks, no edition flags. README says so |
 | Storage: SQLite default, Postgres for teams, pure Go, migrations at start | Section 12 |
 | Admin API under `/admin/v1/`, OpenAPI file, same identity, cursor pagination, no UI | Section 11 |
-| Contributing files, `make check`, 80% coverage, golangci-lint, `-race` in CI | Section 15 |
+| Shared repository files, `make check`, merge rules, commit and push after every change | Section 15 |
 | `github.com/raven-clown/transponder`, Apache-2.0, Go 1.26+ | `go 1.26` in go.mod |
 
 Contract changes to agree:
@@ -418,12 +441,12 @@ Open, for the user to decide (my lean in brackets):
 1. Make `provider` a public package in v1 so adapters can live out of tree and transponder can be embedded as a Go library. [Later. Keep it internal until the interface has had real contributors.]
 2. Unpriced models when a budget applies: serve at zero cost, or reject. [Serve, warn, count. Rejecting breaks Ollama users who forget to add a zero price.]
 3. Budget status code: 402 or 429. [402.]
-4. Multi-tenancy (separate organisations with their own providers and budgets in one instance). The contract lists it as free, but it adds a tenant id to every table and query. [Not in v1. Teams cover one organisation. Design the tables so `tenant_id` can be added later without rewriting queries.]
+4. Multi-tenancy (separate organisations with their own providers, keys and budgets in one instance). The contract lists it as free, and litellm charges for it, so it is a selling point. It touches every table and query. [Put an `org_id` column on every runtime and usage table in v1, always `default`, with every query filtered by it. Ship the organisation endpoints and org admins in the release after v1. That keeps v1 small and avoids a data migration later.]
 5. Next features after v1, in order. [OpenAI Responses API (Codex CLI uses it), request-per-minute limits per user, Bedrock and Vertex adapters, exact-match caching, `LISTEN/NOTIFY` reload.]
 
 ## 15. Testing and CI
 
-Test-driven throughout, following the shared CONTRIBUTING rules. CI on Linux runs `make check`: `go test -race ./...`, `golangci-lint run`, and the 80% total coverage check. On the Windows dev machine there is no gcc, so local runs drop `-race`; `make check` detects that and says so instead of failing.
+Test-driven throughout, following the shared CONTRIBUTING rules. CI runs on every pull request: `test` on Linux, macOS and Windows (with `-race` except on Windows), `coverage` at 80% or more, `lint` with golangci-lint, CodeQL, dependency review and a Conventional Commits title check. `make check` runs lint and coverage locally. The Windows dev machine has no gcc and no make, so local runs use `go test ./...` and `golangci-lint run ./...` directly and CI covers the race detector.
 
 - dialect packages: golden JSON and SSE fixtures for decode, encode and usage parsing in both directions.
 - provider packages: `providertest` conformance against `httptest` servers that replay recorded provider responses. No network in unit tests.
@@ -434,7 +457,7 @@ Test-driven throughout, following the shared CONTRIBUTING rules. CI on Linux run
 - server: end-to-end through `httptest.Server` with the echo provider: first-start admin key, creating a provider and route through the admin API, calling the gateway, headers, trailers, budgets, `/v1/usage`, health endpoints.
 - Live smoke tests behind a `live` build tag, run by hand with real keys before a release.
 
-Repository setup copies `contributing/` from mothership (CONTRIBUTING, issue and pull request templates, labels) and adds a "Writing a provider adapter" section. Commits use Conventional Commits. After this spec is approved, milestone 1 is drafted as issues in `docs/issues.md`, in the format of `contributing/labels.md`, with a few `good first issue` items, before anything is posted.
+The repository root holds the shared files from mothership's `contributing/`: CONTRIBUTING, AGENTS.md (with CLAUDE.md, GEMINI.md and `.github/copilot-instructions.md` pointing to it), SECURITY, CODE_OF_CONDUCT, CHANGELOG, LICENSE, issue and pull request templates, CODEOWNERS, the CI workflows, Dependabot, `.golangci.yml`, `.testcoverage.yml`, the Makefile and `.gitattributes`. CONTRIBUTING gets a "Writing a provider adapter" section. Every change is its own commit with a Conventional Commits message, AGENTS.md is updated in the same commit when commands, layout or rules change, and commits are pushed once the GitHub repository exists. `main` only changes through squash-merged pull requests with every check green. After this spec is approved, milestone 1 is drafted as issues in `docs/issues.md`, in the format of `contributing/labels.md`, with a few `good first issue` items, for review before anything is posted.
 
 ## 16. Demo
 
