@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,5 +53,35 @@ func TestRecordAndRecentUsage(t *testing.T) {
 	want := []store.UsageRecord{record(3, store.DefaultOrg), record(2, store.DefaultOrg)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestRecordUsageUnderLoad(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	const n = 200
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { errs <- db.RecordUsage(ctx, record(int64(i), store.DefaultOrg)) })
+	}
+	wg.Wait()
+	close(errs)
+	failed := 0
+	for err := range errs {
+		if err != nil {
+			failed++
+			t.Log(err)
+		}
+	}
+	if failed > 0 {
+		t.Fatalf("%d of %d writes failed", failed, n)
+	}
+	recs, err := db.RecentUsage(ctx, store.DefaultOrg, n+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != n {
+		t.Fatalf("records = %d, want %d", len(recs), n)
 	}
 }
