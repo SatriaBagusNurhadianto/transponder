@@ -28,10 +28,10 @@ Planned in `docs/design.md` section 4. Packages marked (planned) do not exist ye
 - `internal/auth`: OIDC JWT verification, API keys, identity and roles
 - `internal/server` (planned): HTTP mux, middleware, gateway handlers
 - `internal/admin` (planned): `/admin/v1` handlers, pagination, audit writes
-- `internal/schema` (planned): canonical request, response, stream and usage types
+- `internal/schema`: canonical request, response, stream and usage types
 - `internal/dialect/openai`, `internal/dialect/anthropic` (planned): wire formats and usage parsing
 - `internal/router` (planned): routes, access, fallback, cooldown
-- `internal/provider/<name>` (planned): one adapter per backend; `providertest` is the conformance suite
+- `internal/provider`, `internal/provider/<name>`: the Provider interface and one adapter per backend (`echo` so far); `providertest` (planned) is the conformance suite
 - `internal/store`, `internal/store/sqlite`: store interfaces, SQLite with embedded migrations in `internal/store/sqlite/migrations`
 - `internal/pricing`, `internal/budget`, `internal/runtime`, `internal/secrets`, `internal/telemetry` (planned): prices, budgets, live config, sealed secrets, logs and metrics
 - `internal/testutil` (planned): shared fakes
