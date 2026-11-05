@@ -30,7 +30,7 @@ func TestDecodeChatRequestErrors(t *testing.T) {
 		{name: "bad json", body: `{"model":`, code: "invalid_json"},
 		{name: "missing model", body: `{"messages":[{"role":"user","content":"x"}]}`, param: "model", code: "missing_field"},
 		{name: "empty messages", body: `{"model":"m","messages":[]}`, param: "messages", code: "missing_field"},
-		{name: "content parts", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`, param: "messages", code: "unsupported"},
+		{name: "content parts", body: `{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, param: "messages", code: "unsupported"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

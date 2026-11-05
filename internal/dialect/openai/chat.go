@@ -61,8 +61,22 @@ func DecodeChatRequest(r io.Reader) (*schema.ChatRequest, error) {
 		content := ""
 		raw := bytes.TrimSpace(m.Content)
 		if len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+			// Try a plain string first.
 			if err := json.Unmarshal(raw, &content); err != nil {
-				return nil, &RequestError{Param: "messages", Code: "unsupported", Message: "only string message content is supported so far"}
+				// Otherwise accept an array of text parts.
+				var parts []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				if err2 := json.Unmarshal(raw, &parts); err2 != nil {
+					return nil, &RequestError{Param: "messages", Code: "unsupported", Message: "only string message content is supported so far"}
+				}
+				for _, p := range parts {
+					if p.Type != "text" {
+						return nil, &RequestError{Param: "messages", Code: "unsupported", Message: "only text content parts are supported so far"}
+					}
+					content += p.Text
+				}
 			}
 		}
 		req.Messages = append(req.Messages, schema.Message{Role: m.Role, Content: content})
