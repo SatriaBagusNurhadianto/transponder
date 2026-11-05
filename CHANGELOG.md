@@ -4,6 +4,10 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve every data line when forwarding multiline streaming events.
+
 ## [0.1.0] - 2026-11-05
 
 ### Added
