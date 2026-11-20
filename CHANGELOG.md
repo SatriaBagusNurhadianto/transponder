@@ -16,6 +16,10 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - SiliconFlow provider (`type: siliconflow`) defaulting to `https://api.siliconflow.com/v1` and sending `api_key` as a bearer token. A `base_url` still overrides that default. The China host is `https://api.siliconflow.cn/v1`. No prices are included, so calls are logged as unpriced.
 - LM Studio provider (`type: lmstudio`) defaulting to `http://localhost:1234/v1`. `api_key` is optional and, when set, is sent as a bearer token. Targets using `lmstudio` count as free in usage costs.
 
+### Fixed
+
+- A `${VARIABLE}` on a YAML comment line no longer has to be set for the config to load. A line that starts with `#` inside a `|` or `>` block is part of the value, so variables there are still expanded.
+
 ## [0.2.4] - 2026-11-14
 
 ### Added
