@@ -170,6 +170,36 @@ routes:
 	}
 }
 
+func TestLoadMistral(t *testing.T) {
+	p := writeFile(t, `providers:
+  - name: mistral
+    type: mistral
+    api_key: ${MISTRAL_API_KEY}
+  - name: custom
+    type: mistral
+    api_key: ${MISTRAL_API_KEY}
+    base_url: https://gateway.example/v1
+routes:
+  - match: "mistral-*"
+    targets:
+      - provider: mistral
+  - match: "custom/*"
+    targets:
+      - provider: custom
+`)
+	c, err := Load(p, []string{"MISTRAL_API_KEY=k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Provider{
+		{Name: "mistral", Type: "mistral", APIKey: "k"},
+		{Name: "custom", Type: "mistral", BaseURL: "https://gateway.example/v1", APIKey: "k"},
+	}
+	if !reflect.DeepEqual(c.Providers, want) {
+		t.Fatalf("providers = %+v", c.Providers)
+	}
+}
+
 func TestLoadXAI(t *testing.T) {
 	p := writeFile(t, `providers:
   - name: xai
