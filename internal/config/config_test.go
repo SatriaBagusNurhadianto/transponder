@@ -290,6 +290,36 @@ routes:
 	}
 }
 
+func TestLoadSiliconflow(t *testing.T) {
+	p := writeFile(t, `providers:
+  - name: siliconflow
+    type: siliconflow
+    api_key: ${SILICONFLOW_API_KEY}
+  - name: custom
+    type: siliconflow
+    api_key: ${SILICONFLOW_API_KEY}
+    base_url: https://gateway.example/v1
+routes:
+  - match: "siliconflow-*"
+    targets:
+      - provider: siliconflow
+  - match: "custom/*"
+    targets:
+      - provider: custom
+`)
+	c, err := Load(p, []string{"SILICONFLOW_API_KEY=k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Provider{
+		{Name: "siliconflow", Type: "siliconflow", APIKey: "k"},
+		{Name: "custom", Type: "siliconflow", BaseURL: "https://gateway.example/v1", APIKey: "k"},
+	}
+	if !reflect.DeepEqual(c.Providers, want) {
+		t.Fatalf("providers = %+v", c.Providers)
+	}
+}
+
 func TestLoadXAI(t *testing.T) {
 	p := writeFile(t, `providers:
   - name: xai

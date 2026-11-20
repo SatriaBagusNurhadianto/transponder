@@ -20,6 +20,7 @@ import (
 	"github.com/raven-clown/transponder/internal/provider/ollama"
 	"github.com/raven-clown/transponder/internal/provider/openai"
 	"github.com/raven-clown/transponder/internal/provider/openrouter"
+	"github.com/raven-clown/transponder/internal/provider/siliconflow"
 	"github.com/raven-clown/transponder/internal/provider/vercel"
 	"github.com/raven-clown/transponder/internal/provider/vllm"
 	"github.com/raven-clown/transponder/internal/provider/xai"
@@ -81,6 +82,9 @@ var specs = []Spec{
 	}},
 	{Type: "cerebras", New: func(s Settings) provider.Provider {
 		return cerebras.New(s.Name, s.BaseURL, s.APIKey, s.Client)
+	}},
+	{Type: "siliconflow", New: func(s Settings) provider.Provider {
+		return siliconflow.New(s.Name, s.BaseURL, s.APIKey, s.Client)
 	}},
 	{Type: "vllm", Free: true, New: func(s Settings) provider.Provider {
 		return vllm.New(s.Name, s.BaseURL, s.APIKey, s.Client)
