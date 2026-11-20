@@ -116,7 +116,7 @@ func TestLoadRejects(t *testing.T) {
 		{name: "negative cooldown failures", body: "settings:\n  cooldown_failures: -1\n", want: "cooldown_failures"},
 		{name: "negative attempt timeout", body: "settings:\n  attempt_timeout: -1s\n", want: "attempt_timeout"},
 		{name: "request timeout not a duration", body: "settings:\n  request_timeout: soon\n", want: "`soon`"},
-		{name: "unknown type lists the known ones", body: "providers:\n  - {name: b, type: bedrock}\n", want: "known types are anthropic, cloudflare, echo, gemini"},
+		{name: "unknown type lists the known ones", body: "providers:\n  - {name: b, type: bedrock}\n", want: "known types are anthropic, cerebras, cloudflare, echo, gemini"},
 		{name: "cloudflare without base URL", body: "providers:\n  - {name: cf, type: cloudflare}\nroutes:\n  - {match: '*', targets: [{provider: cf}]}\n", want: `provider "cf" of type cloudflare needs base_url`},
 		{name: "route without match", body: "providers:\n  - {name: a, type: echo}\nroutes:\n  - targets: [{provider: a}]\n", want: "routes[0]"},
 		{name: "providers without routes", body: "providers:\n  - {name: a, type: openai}\n", want: "routes"},
@@ -254,6 +254,36 @@ routes:
 	want := []Provider{
 		{Name: "groq", Type: "groq", APIKey: "k"},
 		{Name: "custom", Type: "groq", BaseURL: "https://gateway.example/openai/v1", APIKey: "k"},
+	}
+	if !reflect.DeepEqual(c.Providers, want) {
+		t.Fatalf("providers = %+v", c.Providers)
+	}
+}
+
+func TestLoadCerebras(t *testing.T) {
+	p := writeFile(t, `providers:
+  - name: cerebras
+    type: cerebras
+    api_key: ${CEREBRAS_API_KEY}
+  - name: custom
+    type: cerebras
+    api_key: ${CEREBRAS_API_KEY}
+    base_url: https://gateway.example/v1
+routes:
+  - match: "cerebras-*"
+    targets:
+      - provider: cerebras
+  - match: "custom/*"
+    targets:
+      - provider: custom
+`)
+	c, err := Load(p, []string{"CEREBRAS_API_KEY=k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Provider{
+		{Name: "cerebras", Type: "cerebras", APIKey: "k"},
+		{Name: "custom", Type: "cerebras", BaseURL: "https://gateway.example/v1", APIKey: "k"},
 	}
 	if !reflect.DeepEqual(c.Providers, want) {
 		t.Fatalf("providers = %+v", c.Providers)

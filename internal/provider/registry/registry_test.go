@@ -20,6 +20,7 @@ func TestLookup(t *testing.T) {
 		{typ: "openrouter"},
 		{typ: "xai"},
 		{typ: "vercel"},
+		{typ: "cerebras"},
 		{typ: "groq"},
 		{typ: "nvidia"},
 		{typ: "mistral"},
