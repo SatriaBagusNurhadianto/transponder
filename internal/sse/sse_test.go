@@ -107,6 +107,52 @@ func TestFrame(t *testing.T) {
 	}
 }
 
+// TestAllocations keeps the per-event cost of a relay down: a frame is built in one allocation,
+// and reading an event allocates its data and nothing per line.
+func TestAllocations(t *testing.T) {
+	data := []byte("{\"type\":\"content_block_delta\",\"index\":0}\nsecond line")
+	if n := testing.AllocsPerRun(100, func() { Frame("content_block_delta", data) }); n != 1 {
+		t.Errorf("Frame allocates %v times, want 1", n)
+	}
+	stream := strings.Repeat("event: delta\ndata: {\"text\":\"hello\"}\n\n", 200)
+	src := strings.NewReader(stream)
+	r := NewReader(src)
+	// One for the event's name and one for its data.
+	if n := testing.AllocsPerRun(100, func() {
+		if _, err := r.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}); n > 2 {
+		t.Errorf("Next allocates %v times per event, want at most 2", n)
+	}
+}
+
+// TestReaderEndsCleanly checks streams whose last line has no newline but holds no event: a
+// comment, a field the reader ignores or stray spaces end the stream cleanly, since nothing
+// was cut. Gemini streams end with io.EOF only.
+func TestReaderEndsCleanly(t *testing.T) {
+	for name, tail := range map[string]string{
+		"comment":       ": keep-alive",
+		"ignored field": "id: 7",
+		"spaces":        "  ",
+		"carriage":      "\r",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := readAll(t, "data: a\n\n"+tail)
+			if !errors.Is(err, io.EOF) || len(got) != 1 || string(got[0].Data) != "a" {
+				t.Fatalf("events %+v, err %v; want one event and io.EOF", got, err)
+			}
+		})
+	}
+}
+
+func TestReaderByteOrderMark(t *testing.T) {
+	got, err := readAll(t, "\xEF\xBB\xBFevent: x\ndata: a\n\n")
+	if !errors.Is(err, io.EOF) || len(got) != 1 || got[0].Name != "x" || string(got[0].Data) != "a" {
+		t.Fatalf("events %+v, err %v", got, err)
+	}
+}
+
 func TestReaderEmptyData(t *testing.T) {
 	got, err := readAll(t, "event: ping\ndata:\n\n")
 	if !errors.Is(err, io.EOF) || len(got) != 1 || got[0].Name != "ping" || got[0].Data == nil || len(got[0].Data) != 0 {

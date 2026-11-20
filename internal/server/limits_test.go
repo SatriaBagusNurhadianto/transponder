@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,9 +22,15 @@ import (
 	"github.com/raven-clown/transponder/internal/server"
 	"github.com/raven-clown/transponder/internal/store"
 	"github.com/raven-clown/transponder/internal/store/sqlite"
+	"github.com/raven-clown/transponder/internal/tokens"
 )
 
 func setupLimited(t *testing.T, routes []router.Route, cfg limits.Config) *env {
+	t.Helper()
+	return setupLimitedStore(t, routes, cfg, limits.NewMemoryStore())
+}
+
+func setupLimitedStore(t *testing.T, routes []router.Route, cfg limits.Config, counters limits.Store) *env {
 	t.Helper()
 	ctx := context.Background()
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
@@ -45,7 +52,7 @@ func setupLimited(t *testing.T, routes []router.Route, cfg limits.Config) *env {
 		Usage:   db,
 		Logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		Now:     time.Now,
-		Limiter: limits.New(cfg, limits.NewMemoryStore(), time.Now),
+		Limiter: limits.New(cfg, counters, time.Now),
 	}))
 	t.Cleanup(srv.Close)
 	return &env{srv: srv, db: db, key: plain}
@@ -55,6 +62,48 @@ func oneProfile(edit func(*limits.Profile)) limits.Config {
 	p := limits.Profile{Name: "p"}
 	edit(&p)
 	return limits.Config{Profiles: []limits.Profile{p}, DefaultProfile: "p"}
+}
+
+// downStore is a shared counter store that cannot be reached.
+type downStore struct{}
+
+var errDown = errors.New("connection refused")
+
+func (downStore) Add(context.Context, string, int64, int64, limits.Window, time.Time) (limits.Result, error) {
+	return limits.Result{}, errDown
+}
+func (downStore) Adjust(context.Context, string, int64, limits.Window, time.Time) error {
+	return errDown
+}
+func (downStore) Used(context.Context, string, limits.Window, time.Time) (int64, error) {
+	return 0, errDown
+}
+func (downStore) Take(context.Context, string, int64, limits.Rate, time.Time) (limits.Bucket, error) {
+	return limits.Bucket{}, errDown
+}
+func (downStore) Settle(context.Context, string, int64, limits.Rate, time.Time) error { return errDown }
+func (downStore) Acquire(context.Context, string, int64) (bool, func(), error) {
+	return false, func() {}, errDown
+}
+
+func TestLimitStoreDown(t *testing.T) {
+	cfg := limits.Config{Budgets: []limits.Budget{{Subject: "user:*", Window: limits.Month, LimitNUSD: 1e9}}}
+	routes := echoRoutes(echo.New("echo"))
+
+	deny := setupLimitedStore(t, routes, cfg, &limits.Failover{Shared: downStore{}, Local: limits.NewMemoryStore(), Deny: true})
+	res := deny.post(t, ping)
+	if res.status != http.StatusServiceUnavailable || errorCode(t, res) != "overloaded" || res.header.Get("Retry-After") != "1" {
+		t.Fatalf("deny: status %d, headers %v: %s", res.status, res.header, res.body)
+	}
+	res = deny.messages(t, nil, `{"model":"m","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`)
+	if res.status != http.StatusServiceUnavailable || anthropicErrorType(t, res) != "api_error" {
+		t.Fatalf("deny messages: status %d: %s", res.status, res.body)
+	}
+
+	local := setupLimitedStore(t, routes, cfg, &limits.Failover{Shared: downStore{}, Local: limits.NewMemoryStore()})
+	if res := local.post(t, ping); res.status != http.StatusOK {
+		t.Fatalf("local: status %d: %s", res.status, res.body)
+	}
 }
 
 func TestBudgetDenied(t *testing.T) {
@@ -225,9 +274,46 @@ func TestInputEstimateCountsTextThatLooksLikeData(t *testing.T) {
 			t.Fatalf("%s slipped past: %d %s", name, res.status, res.body)
 		}
 	}
-	small := `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + strings.Repeat("QUJD", 500) + `"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,` + strings.Repeat("QUJD", 500) + `"}}]}]}`
+	// Each image is 20,000 characters of base64, 5,000 tokens if it were read as text, and
+	// counts as tokens.Image instead.
+	e = setupLimited(t, []router.Route{anthropicRoute("*", "", statusUpstream(t, 500, `{}`))}, oneProfile(func(p *limits.Profile) { p.MaxInputTokens = 2*tokens.Image + 100 }))
+	data := strings.Repeat("QUJD", 5000)
+	small := `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + data + `"}},{"type":"image_url","image_url":{"url":"data:image/png;base64,` + data + `"}}]}]}`
 	if res := e.messages(t, nil, small); res.status == http.StatusBadRequest {
 		t.Fatalf("base64 images counted as text: %s", res.body)
+	}
+}
+
+func TestInputEstimateCountsImages(t *testing.T) {
+	up := upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	e := setupLimited(t, []router.Route{openaiRoute("*", "", up)}, oneProfile(func(p *limits.Profile) { p.MaxInputTokens = 2*tokens.Image + 100 }))
+	image := `{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}`
+	block := `{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}`
+	tests := []struct {
+		name, path, content string
+		status              int
+	}{
+		{"two images fit", "/v1/chat/completions", image + "," + image, http.StatusOK},
+		{"three images are over the limit", "/v1/chat/completions", image + "," + image + "," + image, http.StatusBadRequest},
+		{"three image blocks are over the limit", "/v1/messages", block + "," + block + "," + block, http.StatusBadRequest},
+		// A tool schema may use the word image as a type without being a picture.
+		{"an object of type image without a source is not one", "/v1/chat/completions", image + "," + image + `,{"type":"text","text":"{\"type\":\"image\"}"}`, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := e.doPath(http.MethodPost, tt.path, e.auth(), `{"model":"m","max_tokens":1,"messages":[{"role":"user","content":[`+tt.content+`]}]}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.status != tt.status {
+				t.Fatalf("status %d, want %d: %s", res.status, tt.status, res.body)
+			}
+			if tt.status == http.StatusBadRequest && !strings.Contains(string(res.body), "over the limit") {
+				t.Fatalf("refused for another reason: %s", res.body)
+			}
+		})
 	}
 }
 

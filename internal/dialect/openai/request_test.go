@@ -28,7 +28,7 @@ func TestEncodeChatRequestRoundTrip(t *testing.T) {
 		t.Fatalf("tool_choice %s", wire["tool_choice"])
 	}
 
-	named := &schema.ChatRequest{Model: "m", Messages: []schema.Message{{Role: "user", Content: "x"}}, Stream: true,
+	named := &schema.ChatRequest{Model: "m", Messages: []schema.Message{{Role: "user", Content: schema.Text("x")}}, Stream: true,
 		ToolChoice: &schema.ToolChoice{Mode: schema.ToolChoiceTool, Name: "f"}}
 	b, err = EncodeChatRequest(named)
 	if err != nil {
@@ -127,13 +127,42 @@ func TestChunkDecoderRepeatedToolStart(t *testing.T) {
 	}
 }
 
+func TestShortenToolCallIDsRaw(t *testing.T) {
+	long := "gm_" + strings.Repeat("eyJpIjoiY2FsbF8x", 12)
+	tests := []struct {
+		name, body string
+		changed    bool
+	}{
+		{"no tool calls", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, false},
+		{"short id", `{"messages":[{"role":"tool","tool_call_id":"call_1","content":"x"}]}`, false},
+		{"long id", `{"messages":[{"role":"tool","tool_call_id":"` + long + `","content":"x"}]}`, true},
+		// A key written with escapes is the same key once decoded.
+		{"escaped key", `{"messages":[{"role":"tool","tool_call_id":"` + long + `","content":"x"}]}`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ShortenToolCallIDs([]byte(tt.body))
+			if changed := string(got) != tt.body; changed != tt.changed {
+				t.Fatalf("changed = %v: %s", changed, got)
+			}
+			if tt.changed && strings.Contains(string(got), long) {
+				t.Fatalf("long id kept: %s", got)
+			}
+		})
+	}
+	plain := []byte(tests[0].body)
+	if n := testing.AllocsPerRun(50, func() { ShortenToolCallIDs(plain) }); n != 0 {
+		t.Errorf("a body without tool calls costs %v allocations, want 0", n)
+	}
+}
+
 func TestLongToolCallIDsAreShortened(t *testing.T) {
 	long := "gm_" + strings.Repeat("eyJpIjoiY2FsbF8x", 12)
 	req := &schema.ChatRequest{Model: "m", Messages: []schema.Message{
-		{Role: schema.RoleUser, Content: "x"},
+		{Role: schema.RoleUser, Content: schema.Text("x")},
 		{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: long, Name: "f", Arguments: "{}"}, {ID: "call_short", Name: "g", Arguments: "{}"}}},
-		{Role: schema.RoleTool, ToolCallID: long, Content: "1"},
-		{Role: schema.RoleTool, ToolCallID: "call_short", Content: "2"},
+		{Role: schema.RoleTool, ToolCallID: long, Content: schema.Text("1")},
+		{Role: schema.RoleTool, ToolCallID: "call_short", Content: schema.Text("2")},
 	}}
 	b, err := EncodeChatRequest(req)
 	if err != nil {

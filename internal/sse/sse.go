@@ -22,7 +22,8 @@ type Event struct {
 
 // Reader reads events from a stream.
 type Reader struct {
-	r *bufio.Reader
+	r     *bufio.Reader
+	begun bool
 }
 
 // NewReader reads events from r.
@@ -75,13 +76,32 @@ func (s *Reader) Next() (Event, error) {
 			}
 		}
 		if eof {
-			return ev, io.ErrUnexpectedEOF
+			if started {
+				return ev, io.ErrUnexpectedEOF
+			}
+			return Event{}, io.EOF
 		}
 	}
 }
 
 func (s *Reader) readLine() ([]byte, error) {
-	var line []byte
+	if !s.begun {
+		// A stream may begin with a UTF-8 byte order mark, which is not part of its first line.
+		s.begun = true
+		if b, err := s.r.Peek(3); err == nil && bytes.Equal(b, []byte("\xEF\xBB\xBF")) {
+			_, _ = s.r.Discard(3)
+		}
+	}
+	// A line that fits the buffer is returned without a copy. It is only valid until the next
+	// read, and Next copies what it keeps before then.
+	chunk, err := s.r.ReadSlice('\n')
+	if len(chunk) > MaxEventBytes {
+		return nil, ErrEventTooLarge
+	}
+	if !errors.Is(err, bufio.ErrBufferFull) {
+		return chunk, err
+	}
+	line := append([]byte(nil), chunk...)
 	for {
 		chunk, err := s.r.ReadSlice('\n')
 		line = append(line, chunk...)
@@ -94,9 +114,20 @@ func (s *Reader) readLine() ([]byte, error) {
 	}
 }
 
+const maxPresized = 64 << 20
+
 // Frame renders one event: an event: line when name is set and one data: line per line of data.
 func Frame(name string, data []byte) []byte {
-	var out []byte
+	// Sized up front so a frame is one allocation. Past maxPresized the sum could overflow an
+	// int on 32-bit systems, so such a frame grows as it is written.
+	var size int
+	if len(data) < maxPresized && len(name) < maxPresized {
+		size = len(data) + 1 + (bytes.Count(data, []byte{'\n'})+1)*len("data: \n")
+		if name != "" {
+			size += len("event: \n") + len(name)
+		}
+	}
+	out := make([]byte, 0, size)
 	if name != "" {
 		out = append(append(append(out, "event: "...), name...), '\n')
 	}

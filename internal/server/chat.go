@@ -10,6 +10,7 @@ import (
 	"github.com/raven-clown/transponder/internal/limits"
 	"github.com/raven-clown/transponder/internal/provider"
 	"github.com/raven-clown/transponder/internal/schema"
+	"github.com/raven-clown/transponder/internal/tokens"
 )
 
 var zeroUsage schema.Usage
@@ -28,7 +29,8 @@ func (g *gateway) chat(w http.ResponseWriter, r *http.Request) {
 	if !g.resolve(c, peek.Model) {
 		return
 	}
-	if !g.admit(c, limits.Estimate{InputTokens: estimateInput(c.body), OutputTokens: requestedMax(c.body, "max_completion_tokens", "max_tokens"), Choices: requestedMax(c.body, "n")}) {
+	top := topFields(c.body)
+	if !g.admit(c, limits.Estimate{InputTokens: estimateInput(c.body), OutputTokens: maxField(top, "max_completion_tokens", "max_tokens"), Choices: maxField(top, "n")}) {
 		return
 	}
 	out, _ := c.ticket.Caps()
@@ -70,7 +72,7 @@ func (g *gateway) chatNative(c *call, n provider.Native) error {
 	}
 	u, ok := openai.ParseUsage(out)
 	if !ok {
-		u = schema.Usage{InputTokens: estimateTokens(promptText(c.body)), OutputTokens: estimateTokens(replyText(out))}
+		u = schema.Usage{InputTokens: promptTokens(c.body), OutputTokens: estimateTokens(replyText(out))}
 		c.rec.Estimated = true
 	}
 	cost := g.price(c.r.Context(), c, u)
@@ -99,11 +101,16 @@ func (g *gateway) chatCanonical(c *call) error {
 		writeError(c.w, http.StatusInternalServerError, "api_error", "", "", "could not encode the response")
 		return nil //nolint:nilerr // the 500 above is the answer
 	}
-	cost := g.price(c.r.Context(), c, resp.Usage)
+	u := resp.Usage
+	if !reported(u) {
+		u = schema.Usage{InputTokens: promptTokens(c.body), OutputTokens: estimateTokens(answerText(resp))}
+		c.rec.Estimated = true
+	}
+	cost := g.price(c.r.Context(), c, u)
 	c.rec.Status = http.StatusOK
 	g.recordCall(c.r.Context(), c)
 
-	setUsageHeaders(c.w.Header(), resp.Usage, cost)
+	setUsageHeaders(c.w.Header(), u, cost)
 	c.w.Header().Set("Content-Type", "application/json")
 	c.w.WriteHeader(http.StatusOK)
 	_, _ = c.w.Write(body) //nolint:gosec // JSON we encoded, served as application/json
@@ -138,31 +145,62 @@ func replyText(body []byte) string {
 	return b.String()
 }
 
-// promptText joins the text of the request messages, for estimating input tokens.
-func promptText(body []byte) string {
+// reported tells usage a provider sent from none at all, which translated responses and
+// streams carry as zeros. No real call uses zero tokens.
+func reported(u schema.Usage) bool {
+	return u != schema.Usage{}
+}
+
+// answerText joins the text and tool arguments of a translated answer, for estimating output tokens.
+func answerText(resp *schema.ChatResponse) string {
+	var b strings.Builder
+	b.WriteString(resp.Message.Text())
+	for _, tc := range resp.Message.ToolCalls {
+		b.WriteString(tc.Name)
+		b.WriteString(tc.Arguments)
+	}
+	return b.String()
+}
+
+// promptTokens estimates the input of a chat request from the text of its messages, plus
+// tokens.Image for each image, for a provider that reports no usage.
+func promptTokens(body []byte) int64 {
 	var w struct {
 		Messages []struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
 	if json.Unmarshal(body, &w) != nil {
-		return string(body)
+		return estimateTokens(string(body))
 	}
 	var b strings.Builder
+	var images int64
 	for _, m := range w.Messages {
 		var s string
 		if json.Unmarshal(m.Content, &s) == nil {
 			b.WriteString(s)
 			continue
 		}
-		var parts []struct {
-			Text string `json:"text"`
+		var parts []json.RawMessage
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue
 		}
-		if json.Unmarshal(m.Content, &parts) == nil {
-			for _, p := range parts {
-				b.WriteString(p.Text)
+		for _, raw := range parts {
+			var p struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			_ = json.Unmarshal(raw, &p)
+			switch p.Type {
+			case "text":
+				b.Write([]byte(p.Text))
+			case "image_url":
+				images++
+			default:
+				// A file or audio part is read by the model too, so its data counts.
+				b.Write(raw)
 			}
 		}
 	}
-	return b.String()
+	return estimateTokens(b.String()) + images*tokens.Image
 }

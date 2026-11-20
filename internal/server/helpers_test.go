@@ -20,6 +20,7 @@ import (
 	"github.com/raven-clown/transponder/internal/server"
 	"github.com/raven-clown/transponder/internal/store"
 	"github.com/raven-clown/transponder/internal/store/sqlite"
+	"github.com/raven-clown/transponder/internal/telemetry"
 )
 
 type env struct {
@@ -51,6 +52,15 @@ func setupRoutes(t *testing.T, routes []router.Route) *env {
 
 func setupWith(t *testing.T, routes []router.Route, requestTimeout, attemptTimeout time.Duration) *env {
 	t.Helper()
+	return setupDeps(t, routes, func(d *server.Deps) {
+		d.RequestTimeout, d.AttemptTimeout = requestTimeout, attemptTimeout
+	})
+}
+
+// setupDeps starts a gateway over routes with one member key, after change has adjusted its
+// dependencies.
+func setupDeps(t *testing.T, routes []router.Route, change func(*server.Deps)) *env {
+	t.Helper()
 	ctx := context.Background()
 	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
@@ -65,16 +75,21 @@ func setupWith(t *testing.T, routes []router.Route, requestTimeout, attemptTimeo
 	if err := db.CreateKey(ctx, k); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(server.New(server.Deps{
-		Auth:           auth.NewAuthenticator(db, time.Now),
-		Router:         router.New(routes),
-		RequestTimeout: requestTimeout,
-		AttemptTimeout: attemptTimeout,
-		Prices:         pricing.Default(),
-		Usage:          db,
-		Logger:         slog.New(slog.NewJSONHandler(io.Discard, nil)),
-		Now:            time.Now,
-	}))
+	deps := server.Deps{
+		Auth:   auth.NewAuthenticator(db, time.Now),
+		Router: router.New(routes),
+		Prices: pricing.Default(),
+		Usage:  db,
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		Now:    time.Now,
+		// Every test of the gateway runs with metrics on, so streams, trailers and body
+		// limits are checked through the writer that counts status codes.
+		Metrics: telemetry.NewMetrics("test"),
+	}
+	if change != nil {
+		change(&deps)
+	}
+	srv := httptest.NewServer(server.New(deps))
 	t.Cleanup(srv.Close)
 	return &env{srv: srv, db: db, key: plain}
 }

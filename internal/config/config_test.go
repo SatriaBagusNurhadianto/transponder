@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.yaml.in/yaml/v3"
 )
 
 func writeFile(t *testing.T, body string) string {
@@ -125,7 +127,7 @@ func TestExpandCommentLines(t *testing.T) {
 		name, in, want, missing string
 	}{
 		{name: "indented comment is copied", in: "  # key: ${UNSET}\nb: ${HOST}", want: "  # key: ${UNSET}\nb: h"},
-		{name: "tab before the hash", in: "\t# ${UNSET}", want: "\t# ${UNSET}"},
+		{name: "tab before the hash", in: "a: 1\t# ${UNSET}", want: "a: 1"},
 		{name: "a hash after a value is not a comment line", in: "url: http://${HOST}/#${HOST}", want: "url: http://h/#h"},
 		{name: "a missing variable outside comments still fails", in: "# ${UNSET}\nkey: ${ALSO_UNSET}", missing: "ALSO_UNSET"},
 		{name: "a hash line inside a literal block is expanded", in: "key: |\n  # ${HOST}\n  v: ${HOST}", want: "key: |\n  # h\n  v: h"},
@@ -140,21 +142,65 @@ func TestExpandCommentLines(t *testing.T) {
 		{name: "a sequence block expands a hash line", in: "- |\n  # ${HOST}\n- ${HOST}", want: "- |\n  # h\n- h"},
 		{name: "a sibling of a sequence key is outside the block", in: "- name: |\n    # ${HOST}\n  # ${UNSET}\n  age: ${HOST}", want: "- name: |\n    # h\n  # ${UNSET}\n  age: h"},
 		{name: "a carriage return is preserved", in: "# ${UNSET}\r\nkey: ${HOST}\r\n", want: "# ${UNSET}\r\nkey: h\r\n"},
+		{name: "a key is expanded", in: "${HOST}: 1", want: "h: 1"},
+		{name: "two missing variables are named once each, sorted", in: "a: ${B}${A}\nb: ${A}", missing: "A, B"},
+		{name: "a merge key keeps the expanded anchor", in: "base: &b {x: '${HOST}'}\nuse:\n  <<: *b\n", want: "base: {x: h}\nuse: {x: h}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := expand(tt.in, env)
+			doc, err := expand([]byte(tt.in), env)
 			if tt.missing != "" {
 				if err == nil || err.Error() != "config: environment variables not set: "+tt.missing {
 					t.Fatalf("err = %v, want only %s named", err, tt.missing)
 				}
 				return
 			}
-			if err != nil || got != tt.want {
-				t.Fatalf("expand = %q, %v, want %q", got, err, tt.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got, want any
+			if err := doc.Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			if err := yaml.Unmarshal([]byte(tt.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("expand = %#v, want %#v", got, want)
 			}
 		})
 	}
+}
+
+// FuzzExpand checks that expansion never panics, and that a file without a $ parses as it would
+// without expansion.
+func FuzzExpand(f *testing.F) {
+	for _, s := range []string{
+		"secrets_key: ${K}\n",
+		"key: |\n  # ${K}\n# ${U}\n",
+		"a: [${K}, $K]\nb: {c: \"${K}\"}\n",
+		"x: &a ${K}\ny: *a\nz:\n  <<: {m: 1}\n",
+		"- ? ${K}\n  : >-\n    #${K}\n",
+		"plain: 1\n",
+	} {
+		f.Add(s)
+	}
+	env := map[string]string{"K": "v #: 'x\"\n"}
+	f.Fuzz(func(t *testing.T, in string) {
+		doc, err := expand([]byte(in), env)
+		if strings.Contains(in, "$") || err != nil {
+			return
+		}
+		var got, want any
+		gotErr := doc.Decode(&got)
+		wantErr := yaml.Unmarshal([]byte(in), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("decode errors differ: %v and %v", gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("expand changed a file without variables: %#v, want %#v", got, want)
+		}
+	})
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -165,6 +211,10 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if c.ListenAddr != ":9000" || c.Store.SQLite != "/tmp/x.db" {
 		t.Fatalf("overrides not applied: %+v", c)
+	}
+	c, err = Load(writeFile(t, "previous_secrets_key: from-file\n"), []string{"TRANSPONDER_PREVIOUS_SECRETS_KEY=from-env"})
+	if err != nil || c.PreviousSecretsKey != "from-env" {
+		t.Fatalf("previous_secrets_key %q, %v", c.PreviousSecretsKey, err)
 	}
 }
 
@@ -178,6 +228,7 @@ func TestLoadRejects(t *testing.T) {
 	}{
 		{name: "unknown file key", body: "listen_adr: x\n"},
 		{name: "both stores", body: "store:\n  sqlite: a.db\n  postgres: postgres://x\n"},
+		{name: "previous secrets key alone with Postgres", body: "store:\n  postgres: postgres://x\nprevious_secrets_key: abc\n", want: "previous_secrets_key needs secrets_key"},
 		{name: "bad log level", body: "log_level: loud\n"},
 		{name: "missing file", path: filepath.Join(t.TempDir(), "nope.yaml")},
 		{name: "provider without name", body: "providers:\n  - type: echo\n", want: "providers[0]"},
@@ -519,6 +570,110 @@ func TestLoadUpdateCheck(t *testing.T) {
 	}
 }
 
+func TestLoadIntEnvOverride(t *testing.T) {
+	c, err := Load("", []string{"TRANSPONDER_SETTINGS__COOLDOWN_FAILURES=5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Settings.CooldownFailures != 5 {
+		t.Fatalf("cooldown_failures = %d", c.Settings.CooldownFailures)
+	}
+	if _, err := Load("", []string{"TRANSPONDER_SETTINGS__COOLDOWN_FAILURES=many"}); err == nil || !strings.Contains(err.Error(), "many") {
+		t.Fatalf("err = %v, want it to name the value", err)
+	}
+}
+
+func TestLoadExpandsEdgeCases(t *testing.T) {
+	env := []string{"HOST=h", "SECRET=a #b: c", "QUOTED=\"x' *y", "LINES=one\ntwo", "N=7", "ON=true", "USD=2.5"}
+	tests := []struct {
+		name string
+		body string
+		want func(*Bootstrap) bool
+	}{
+		{
+			name: "a comment indented less than block content is not content",
+			body: "secrets_key: |-\n    a${HOST}\n  # ${UNSET}\nlog_level: info\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "ah" },
+		},
+		{
+			name: "a quoted scalar over lines with a hash line is expanded",
+			body: "secrets_key: \"a\n  #${HOST}\"\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "a #h" },
+		},
+		{
+			name: "a block header with an anchor is a block",
+			body: "secrets_key: &k |-\n  #${HOST}\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "#h" },
+		},
+		{
+			name: "a block header with a tag is a block",
+			body: "secrets_key: !!str |-\n  #${HOST}\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "#h" },
+		},
+		{
+			name: "a comment after a value is not expanded",
+			body: "secrets_key: ${HOST} # was ${UNSET}\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "h" },
+		},
+		{
+			name: "a value with a hash and a colon is kept whole",
+			body: "secrets_key: ${SECRET}\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "a #b: c" },
+		},
+		{
+			name: "a value with quotes and a star is kept whole",
+			body: "secrets_key: ${QUOTED}\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "\"x' *y" },
+		},
+		{
+			name: "a value over two lines is kept whole",
+			body: "secrets_key: ${LINES}\nlog_level: info\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "one\ntwo" },
+		},
+		{
+			name: "a variable inside a flow list",
+			body: "providers: [{name: e, type: echo}]\nroutes:\n  - {match: '*', allow: [user:${HOST}], targets: [{provider: e}]}\n",
+			want: func(c *Bootstrap) bool {
+				return len(c.Routes) == 1 && reflect.DeepEqual(c.Routes[0].Allow, []string{"user:h"})
+			},
+		},
+		{
+			name: "plain values keep their type",
+			body: "update_check: ${ON}\nsettings:\n  cooldown_failures: ${N}\nbudgets:\n  - {subject: 'user:*', period: daily, limit_usd: ${USD}}\n",
+			want: func(c *Bootstrap) bool {
+				return c.UpdateCheck && c.Settings.CooldownFailures == 7 && len(c.Budgets) == 1 && c.Budgets[0].LimitUSD == 2.5
+			},
+		},
+		{
+			name: "a quoted value stays a string",
+			body: "secrets_key: \"${N}\"\n",
+			want: func(c *Bootstrap) bool { return c.SecretsKey == "7" },
+		},
+		{
+			name: "an alias repeats the expanded value",
+			body: "secrets_key: &k ${HOST}x\nprovider_note: *k\n",
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := Load(writeFile(t, tt.body), env)
+			if tt.want == nil {
+				if err == nil || strings.Contains(err.Error(), "environment") {
+					t.Fatalf("err = %v, want the unknown key refused", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tt.want(c) {
+				t.Fatalf("config = %+v", c)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsBadBoolEnv(t *testing.T) {
 	if _, err := Load("", []string{"TRANSPONDER_UPDATE_CHECK=maybe"}); err == nil {
 		t.Fatal("expected an error for a value that is not true or false")
@@ -594,11 +749,94 @@ func TestLoadLimitsRejects(t *testing.T) {
 		"profile without name":    "profiles:\n  - limits: {}\n",
 		"bad budget":              "budgets:\n  - {subject: \"user:*\", period: weekly, limit_usd: 1}\n",
 		"store not supported yet": "limits: {store: valkey}\n",
+		"sql without postgres":    "limits: {store: sql}\n",
+		"unknown store":           "limits: {store: redis}\n",
 		"bad on_store_error":      "limits: {on_store_error: panic}\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(writeFile(t, body), nil); err == nil {
 				t.Fatal("accepted")
+			}
+		})
+	}
+}
+
+func TestOpsListenAddr(t *testing.T) {
+	c, err := Load("", nil)
+	if err != nil || c.OpsListenAddr != "" {
+		t.Fatalf("default ops_listen_addr = %q, err %v; want none", c.OpsListenAddr, err)
+	}
+	p := writeFile(t, "ops_listen_addr: \"127.0.0.1:9464\"\n")
+	if c, err = Load(p, nil); err != nil || c.OpsListenAddr != "127.0.0.1:9464" {
+		t.Fatalf("from the file: %q, err %v", c.OpsListenAddr, err)
+	}
+	if c, err = Load(p, []string{"TRANSPONDER_OPS_LISTEN_ADDR=:9000"}); err != nil || c.OpsListenAddr != ":9000" {
+		t.Fatalf("from the environment: %q, err %v", c.OpsListenAddr, err)
+	}
+}
+
+func TestOTel(t *testing.T) {
+	c, err := Load("", nil)
+	if err != nil || c.OTel.Endpoint != "" {
+		t.Fatalf("tracing is on by default: %+v, err %v", c.OTel, err)
+	}
+	p := writeFile(t, "otel:\n  endpoint: https://otlp.example.com/otlp\n  headers:\n    Authorization: Bearer ${OTEL_KEY}\n  sample_ratio: 0.1\n")
+	c, err = Load(p, []string{"OTEL_KEY=k1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := OTel{Endpoint: "https://otlp.example.com/otlp", Headers: map[string]string{"Authorization": "Bearer k1"}, SampleRatio: 0.1}
+	if !reflect.DeepEqual(c.OTel, want) {
+		t.Fatalf("otel = %+v, want %+v", c.OTel, want)
+	}
+	c, err = Load("", []string{"TRANSPONDER_OTEL__ENDPOINT=http://collector:4318", "TRANSPONDER_OTEL__SAMPLE_RATIO=0.25"})
+	if err != nil || c.OTel.Endpoint != "http://collector:4318" || c.OTel.SampleRatio != 0.25 {
+		t.Fatalf("from the environment: %+v, err %v", c.OTel, err)
+	}
+
+	for name, tt := range map[string]struct {
+		body string
+		env  []string
+		want string
+	}{
+		"grpc address":             {body: "otel: {endpoint: \"collector:4317\"}\n", want: "otel.endpoint"},
+		"another scheme":           {body: "otel: {endpoint: \"grpc://collector:4317\"}\n", want: "otel.endpoint"},
+		"ratio above 1":            {body: "otel: {endpoint: \"http://c:4318\", sample_ratio: 2}\n", want: "otel.sample_ratio"},
+		"negative ratio":           {body: "otel: {endpoint: \"http://c:4318\", sample_ratio: -1}\n", want: "otel.sample_ratio"},
+		"headers with no endpoint": {body: "otel: {headers: {a: b}}\n", want: "otel.endpoint is empty"},
+		"ratio with no endpoint":   {body: "otel: {sample_ratio: 0.5}\n", want: "otel.endpoint is empty"},
+		"ratio that is no number":  {env: []string{"TRANSPONDER_OTEL__ENDPOINT=http://c:4318", "TRANSPONDER_OTEL__SAMPLE_RATIO=half"}, want: "half"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := ""
+			if tt.body != "" {
+				path = writeFile(t, tt.body)
+			}
+			if _, err := Load(path, tt.env); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want it to name %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestSharedLimits(t *testing.T) {
+	tests := []struct {
+		name, body string
+		want       bool
+	}{
+		{"sqlite", "", false},
+		{"postgres", "store: {postgres: postgres://db/t}\n", true},
+		{"postgres with sql", "store: {postgres: postgres://db/t}\nlimits: {store: sql}\n", true},
+		{"postgres with memory", "store: {postgres: postgres://db/t}\nlimits: {store: memory}\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := Load(writeFile(t, tt.body), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.SharedLimits(); got != tt.want {
+				t.Fatalf("SharedLimits = %v, want %v", got, tt.want)
 			}
 		})
 	}

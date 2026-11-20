@@ -159,7 +159,7 @@ func (e *StreamEncoder) flushTools() [][]byte {
 			ID    string          `json:"id"`
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
-		}{"tool_use", t.id, t.name, json.RawMessage(`{}`)})...)
+		}{"tool_use", toolUseID(t.id), t.name, json.RawMessage(`{}`)})...)
 		if t.args.Len() > 0 {
 			out = append(out, frame("content_block_delta", blockDelta{"content_block_delta", e.open, jsonDelta{"input_json_delta", t.args.String()}}))
 		}
@@ -203,6 +203,36 @@ func ErrorFrame(errType, message string) []byte {
 	return frame("error", wireError{Type: "error", Error: wireErrorDetail{Type: errType, Message: message}})
 }
 
+// OpeningEvent reports whether a stream event comes before any output: message_start, a ping,
+// or the start of a text block with no text yet.
+func OpeningEvent(ev sse.Event) bool {
+	// Anthropic names each event after its type; only a block start needs its data read.
+	switch ev.Name {
+	case "message_start", "ping":
+		return true
+	case "", "content_block_start":
+	default:
+		return false
+	}
+	var w struct {
+		Type         string `json:"type"`
+		ContentBlock *struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+	}
+	if json.Unmarshal(ev.Data, &w) != nil {
+		return false
+	}
+	switch w.Type {
+	case "message_start", "ping":
+		return true
+	case "content_block_start":
+		return w.ContentBlock != nil && w.ContentBlock.Type == "text" && w.ContentBlock.Text == ""
+	}
+	return false
+}
+
 // StreamError is an error event sent by Anthropic in the middle of a stream.
 type StreamError struct {
 	Type, Message string
@@ -215,10 +245,11 @@ func (e *StreamError) Error() string {
 // StreamDecoder turns the events of one Anthropic stream into canonical events, and keeps the
 // usage it has seen so far.
 type StreamDecoder struct {
-	usage  schema.Usage
-	done   bool
-	tools  int
-	toolOf map[int]int
+	usage   schema.Usage
+	done    bool
+	tools   int
+	toolOf  map[int]int
+	noInput map[int]bool // tool blocks that have had no input yet
 }
 
 type wireEvent struct {
@@ -253,7 +284,7 @@ func (d *StreamDecoder) Events(ev sse.Event) ([]schema.Event, error) {
 		return nil, fmt.Errorf("anthropic: decoding a stream event: %w", err)
 	}
 	if d.toolOf == nil {
-		d.toolOf = map[int]int{}
+		d.toolOf, d.noInput = map[int]int{}, map[int]bool{}
 	}
 	switch w.Type {
 	case "message_start":
@@ -266,7 +297,21 @@ func (d *StreamDecoder) Events(ev sse.Event) ([]schema.Event, error) {
 			t := d.tools
 			d.tools++
 			d.toolOf[w.Index] = t
-			return []schema.Event{{Type: schema.EventToolStart, ToolIndex: t, ToolID: w.ContentBlock.ID, ToolName: w.ContentBlock.Name}}, nil
+			out := []schema.Event{{Type: schema.EventToolStart, ToolIndex: t, ToolID: w.ContentBlock.ID, ToolName: w.ContentBlock.Name}}
+			// Anthropic starts with {} and streams the input; a server that sends it whole
+			// here may send no delta.
+			if input := string(inputObject(string(w.ContentBlock.Input))); input != "{}" {
+				return append(out, schema.Event{Type: schema.EventToolDelta, ToolIndex: t, ToolArgs: input}), nil
+			}
+			d.noInput[w.Index] = true
+			return out, nil
+		}
+	case "content_block_stop":
+		// A tool that takes no input may get no delta, and the caller still needs arguments
+		// that parse.
+		if d.noInput[w.Index] {
+			delete(d.noInput, w.Index)
+			return []schema.Event{{Type: schema.EventToolDelta, ToolIndex: d.toolOf[w.Index], ToolArgs: "{}"}}, nil
 		}
 	case "content_block_delta":
 		if w.Delta == nil {
@@ -277,6 +322,7 @@ func (d *StreamDecoder) Events(ev sse.Event) ([]schema.Event, error) {
 			return []schema.Event{{Type: schema.EventText, Text: w.Delta.Text}}, nil
 		case "input_json_delta":
 			if t, ok := d.toolOf[w.Index]; ok && w.Delta.PartialJSON != "" {
+				delete(d.noInput, w.Index)
 				return []schema.Event{{Type: schema.EventToolDelta, ToolIndex: t, ToolArgs: w.Delta.PartialJSON}}, nil
 			}
 		}

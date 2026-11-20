@@ -32,6 +32,26 @@ func mustAdmit(t *testing.T, l *Limiter, c Caller, e Estimate) *Ticket {
 	return tk
 }
 
+func TestWithConfig(t *testing.T) {
+	budget := func(nusd int64) Config {
+		return Config{Budgets: []Budget{{Subject: "user:*", Window: Month, LimitNUSD: nusd}}}
+	}
+	l := limiter(t, budget(100))
+	tk := mustAdmit(t, l, alice, Estimate{CostNUSD: 60, NoOutput: true})
+	tk.Settle(0, 60)
+	tk.Release()
+	raised := l.WithConfig(budget(200))
+	if st := raised.Status(ctx, alice); len(st) != 1 || st[0].Used != 60 || st[0].Limit != 200 {
+		t.Fatalf("status after the new config %+v", st)
+	}
+	if _, d := raised.Admit(ctx, alice, Estimate{CostNUSD: 100, NoOutput: true}); d != nil {
+		t.Fatalf("the raised budget refused: %+v", d)
+	}
+	if _, d := l.Admit(ctx, alice, Estimate{CostNUSD: 1, NoOutput: true}); d == nil {
+		t.Fatal("the old limiter does not see what the new one counted")
+	}
+}
+
 func TestNoLimits(t *testing.T) {
 	l := limiter(t, Config{})
 	tk := mustAdmit(t, l, alice, Estimate{InputTokens: 1 << 40, OutputTokens: 1 << 40, CostNUSD: 1 << 60})
@@ -142,6 +162,19 @@ func TestBudgets(t *testing.T) {
 	if _, d := keyed.Admit(ctx, Caller{Key: "ci"}, Estimate{CostNUSD: 2}); d == nil || d.Subject != "key:ci" {
 		t.Fatalf("key budget not applied: %+v", d)
 	}
+}
+
+// A budget of 0 blocks spending; it does not lift the cap, nor the user:* one it replaces.
+func TestZeroBudgetBlocks(t *testing.T) {
+	l := limiter(t, Config{Budgets: []Budget{
+		{Subject: "user:*", Window: Month, LimitNUSD: 1e9},
+		{Subject: "user:alice", Window: Month, LimitNUSD: 0},
+	}})
+	if _, d := l.Admit(ctx, alice, Estimate{CostNUSD: 1e8}); d == nil || d.Code != "budget_exceeded" || d.Subject != "user:alice" {
+		t.Fatalf("a paid call under a zero budget: %+v", d)
+	}
+	bob := Caller{User: "bob"}
+	mustAdmit(t, l, bob, Estimate{CostNUSD: 1e8})
 }
 
 func TestDeniedRollsBack(t *testing.T) {

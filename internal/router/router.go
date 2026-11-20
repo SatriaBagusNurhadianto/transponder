@@ -7,8 +7,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/raven-clown/transponder/internal/auth"
 	"github.com/raven-clown/transponder/internal/provider"
 )
 
@@ -23,9 +25,11 @@ type Target struct {
 	Model    string
 }
 
-// Route sends models matching Match, an exact name or a glob, to its targets in order.
+// Route sends models matching Match, an exact name or a glob, to its targets in order, for the
+// callers Access lets in.
 type Route struct {
 	Match   string
+	Access  Access
 	Targets []Target
 }
 
@@ -36,11 +40,15 @@ type Resolved struct {
 	Type     string
 	Free     bool
 	Model    string
+	// ModelFromCaller is true when Model is whatever name the caller sent: the target sets no
+	// model and the route matches by wildcard. Metrics use it to keep such names off labels.
+	ModelFromCaller bool
 }
 
-// Plan is the targets to try for one call, in order.
+// Plan is the targets to try for one call, in order, and who may make the call.
 type Plan struct {
 	Route   string
+	Access  Access
 	Targets []Resolved
 }
 
@@ -58,26 +66,40 @@ type health struct {
 	until time.Time
 }
 
+// healthTable is the failure record of targets, which routers built by a reload share.
+type healthTable struct {
+	mu sync.Mutex
+	m  map[targetKey]*health
+}
+
 // Router holds the routes in priority order and remembers which targets keep failing.
 type Router struct {
 	routes []Route
 	globs  []*regexp.Regexp
+	// wild says which routes match by * or ?, worked out once instead of on every call.
+	wild []bool
 
+	// cool is read on every call, so it is swapped whole instead of guarded by a lock.
+	cool   atomic.Pointer[cooldownSettings]
+	health *healthTable
+}
+
+type cooldownSettings struct {
 	failures int
 	cooldown time.Duration
 	now      func() time.Time
-	mu       sync.Mutex
-	health   map[targetKey]*health
 }
 
 // New returns a router over routes, first match wins. In Match, * stands for any run of
 // characters, slashes included, since model names such as hf.co/user/repo have them.
 func New(routes []Route) *Router {
 	r := &Router{
-		routes: routes, globs: make([]*regexp.Regexp, len(routes)),
-		failures: DefaultCooldownFailures, cooldown: DefaultCooldown, now: time.Now, health: map[targetKey]*health{},
+		routes: routes, globs: make([]*regexp.Regexp, len(routes)), wild: make([]bool, len(routes)),
+		health: &healthTable{m: map[targetKey]*health{}},
 	}
+	r.cool.Store(&cooldownSettings{failures: DefaultCooldownFailures, cooldown: DefaultCooldown, now: time.Now})
 	for i, rt := range routes {
+		r.wild[i] = strings.ContainsAny(rt.Match, "*?")
 		re := regexp.QuoteMeta(rt.Match)
 		re = strings.ReplaceAll(re, `\*`, ".*")
 		re = strings.ReplaceAll(re, `\?`, ".")
@@ -88,9 +110,22 @@ func New(routes []Route) *Router {
 
 // SetCooldown changes how many failures in a row put a target last, and for how long.
 func (r *Router) SetCooldown(failures int, d time.Duration, now func() time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.failures, r.cooldown, r.now = failures, d, now
+	r.cool.Store(&cooldownSettings{failures: failures, cooldown: d, now: now})
+}
+
+// KeepHealth makes r share prev's record of failing targets, so a reload keeps the cooldowns,
+// and failures that calls still running on prev report reach r. Call it before r serves.
+func (r *Router) KeepHealth(prev *Router) {
+	if prev == nil {
+		r.health = &healthTable{m: map[targetKey]*health{}}
+		return
+	}
+	r.health = prev.health
+}
+
+func (r *Router) settings() (failures int, cooldown time.Duration, now time.Time) {
+	c := r.cool.Load()
+	return c.failures, c.cooldown, c.now()
 }
 
 // Plan returns the targets of the first route matching model. Targets in cooldown come last,
@@ -100,23 +135,24 @@ func (r *Router) Plan(model string) (Plan, error) {
 		if len(rt.Targets) == 0 || !r.globs[i].MatchString(model) {
 			continue
 		}
-		p := Plan{Route: rt.Match}
+		p := Plan{Route: rt.Match, Access: rt.Access}
+		wildcard := r.wild[i]
 		var cooling []Resolved
-		r.mu.Lock()
-		now := r.now()
+		now := r.cool.Load().now()
+		r.health.mu.Lock()
 		for _, t := range rt.Targets {
 			up := t.Model
 			if up == "" {
 				up = model
 			}
-			res := Resolved{Route: rt.Match, Provider: t.Provider, Type: t.Type, Free: t.Free, Model: up}
-			if h, ok := r.health[healthKey(res)]; ok && now.Before(h.until) {
+			res := Resolved{Route: rt.Match, Provider: t.Provider, Type: t.Type, Free: t.Free, Model: up, ModelFromCaller: t.Model == "" && wildcard}
+			if h, ok := r.health.m[healthKey(res)]; ok && now.Before(h.until) {
 				cooling = append(cooling, res)
 				continue
 			}
 			p.Targets = append(p.Targets, res)
 		}
-		r.mu.Unlock()
+		r.health.mu.Unlock()
 		p.Targets = append(p.Targets, cooling...)
 		return p, nil
 	}
@@ -141,31 +177,32 @@ func healthKey(t Resolved) targetKey { return targetKey{t.Provider.Name(), t.Mod
 // configured number of failures in a row the target cools down; once the cooldown ends, one
 // more failure starts it again.
 func (r *Router) Report(t Resolved, ok bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	failures, cooldown, now := r.settings()
+	tab := r.health
+	tab.mu.Lock()
+	defer tab.mu.Unlock()
 	key := healthKey(t)
 	if ok {
-		delete(r.health, key)
+		delete(tab.m, key)
 		return
 	}
-	h := r.health[key]
+	h := tab.m[key]
 	if h == nil {
 		// A target that keeps the caller's model has one entry per model name, so the table is
 		// swept before it can grow without end. Targets in cooldown are kept.
-		if len(r.health) >= maxHealth {
-			now := r.now()
-			for k, e := range r.health {
+		if len(tab.m) >= maxHealth {
+			for k, e := range tab.m {
 				if !now.Before(e.until) {
-					delete(r.health, k)
+					delete(tab.m, k)
 				}
 			}
 		}
 		h = &health{}
-		r.health[key] = h
+		tab.m[key] = h
 	}
 	h.fails++
-	if h.fails >= r.failures {
-		h.until = r.now().Add(r.cooldown)
+	if h.fails >= failures {
+		h.until = now.Add(cooldown)
 	}
 }
 
@@ -173,9 +210,18 @@ func (r *Router) Report(t Resolved, ok bool) {
 // sorted and without duplicates. The models targets send upstream are left out, since a
 // caller asking for one of them would not reach that route.
 func (r *Router) Models() []string {
+	return r.models(func(Access) bool { return true })
+}
+
+// ModelsFor returns the names of Models whose route lets id in.
+func (r *Router) ModelsFor(id auth.Identity) []string {
+	return r.models(func(a Access) bool { return a.Permits(id) })
+}
+
+func (r *Router) models(permits func(Access) bool) []string {
 	seen := map[string]bool{}
 	for _, rt := range r.routes {
-		if !strings.ContainsAny(rt.Match, "*?") {
+		if !strings.ContainsAny(rt.Match, "*?") && permits(rt.Access) {
 			seen[rt.Match] = true
 		}
 	}

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -41,15 +42,11 @@ func EncodeChatRequestWith(req *schema.ChatRequest, o EncodeOptions) ([]byte, er
 				wm.ToolCalls[i].ID = upstreamID(wm.ToolCalls[i].ID)
 			}
 		}
-		if m.Content == "" && len(m.ToolCalls) > 0 {
-			wm.Content = json.RawMessage("null")
-		} else {
-			content, err := json.Marshal(m.Content)
-			if err != nil {
-				return nil, err
-			}
-			wm.Content = content
+		content, err := encodeContent(m)
+		if err != nil {
+			return nil, err
 		}
+		wm.Content = content
 		w.Messages = append(w.Messages, wm)
 	}
 	for _, t := range req.Tools {
@@ -112,7 +109,7 @@ func DecodeChatResponse(body []byte) (*schema.ChatResponse, error) {
 		return nil, err
 	}
 	resp := &schema.ChatResponse{ID: w.ID, Model: w.Model, FinishReason: ch.FinishReason,
-		Message: schema.Message{Role: ch.Message.Role, Content: content}}
+		Message: schema.Message{Role: ch.Message.Role, Content: schema.Text(content)}}
 	if resp.Message.Role == "" {
 		resp.Message.Role = schema.RoleAssistant
 	}
@@ -129,6 +126,33 @@ func DecodeChatResponse(body []byte) (*schema.ChatResponse, error) {
 type ChunkDecoder struct {
 	started bool
 	seen    map[int]bool
+	byID    map[string]int
+	last    int // the call a delta with neither index nor id continues
+	next    int // the index a new call without one gets
+}
+
+// toolIndex places a streamed tool call. Most servers number calls with index; some leave it
+// out, so a new id starts the next call and a delta with neither continues the last one.
+func (d *ChunkDecoder) toolIndex(tc wireToolCall) int {
+	if d.byID == nil {
+		d.byID = map[string]int{}
+	}
+	i := d.last
+	switch {
+	case tc.Index != nil:
+		i = *tc.Index
+	case tc.ID != "":
+		if j, ok := d.byID[tc.ID]; ok {
+			i = j
+		} else {
+			i = d.next
+		}
+	}
+	if _, ok := d.byID[tc.ID]; tc.ID != "" && !ok {
+		d.byID[tc.ID] = i
+	}
+	d.last, d.next = i, max(d.next, i+1)
+	return i
 }
 
 type wireChunkIn struct {
@@ -158,10 +182,7 @@ func (d *ChunkDecoder) Events(data []byte) ([]schema.Event, error) {
 			out = append(out, schema.Event{Type: schema.EventText, Text: *ch.Delta.Content})
 		}
 		for _, tc := range ch.Delta.ToolCalls {
-			i := 0
-			if tc.Index != nil {
-				i = *tc.Index
-			}
+			i := d.toolIndex(tc)
 			if (tc.ID != "" || tc.Function.Name != "") && !d.seen[i] {
 				if d.seen == nil {
 					d.seen = map[int]bool{}
@@ -233,6 +254,11 @@ func upstreamID(id string) string {
 // ShortenToolCallIDs rewrites the tool call ids of a raw chat request that are too long for
 // OpenAI, the same way EncodeChatRequest does. A body with none comes back untouched.
 func ShortenToolCallIDs(body []byte) []byte {
+	// Most calls carry no tool call at all. A key can only hide from this check written with
+	// \u escapes, so a body with any of those is still read in full.
+	if !bytes.Contains(body, []byte("tool_call")) && !bytes.Contains(body, []byte(`\u`)) {
+		return body
+	}
 	var top map[string]json.RawMessage
 	if json.Unmarshal(body, &top) != nil {
 		return body

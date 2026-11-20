@@ -3,12 +3,16 @@ package config
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/raven-clown/transponder/internal/limits"
 	"github.com/raven-clown/transponder/internal/provider/registry"
+	"github.com/raven-clown/transponder/internal/router"
 )
 
 const envPrefix = "TRANSPONDER_"
@@ -27,11 +32,18 @@ type Bootstrap struct {
 	ListenAddr string `yaml:"listen_addr"`
 	Store      Store  `yaml:"store"`
 	SecretsKey string `yaml:"secrets_key"`
-	OTel       OTel   `yaml:"otel"`
-	LogLevel   string `yaml:"log_level"`
+	// PreviousSecretsKey still opens provider keys sealed before secrets_key changed, until
+	// transponder secrets rotate seals them again under secrets_key.
+	PreviousSecretsKey string `yaml:"previous_secrets_key"`
+	OTel               OTel   `yaml:"otel"`
+	LogLevel           string `yaml:"log_level"`
 	// UpdateCheck logs a line at start and once a day when a newer release is out.
 	UpdateCheck bool `yaml:"update_check"`
+	// OpsListenAddr serves /healthz, /readyz and /metrics on a port of their own, where
+	// /metrics needs no key. Empty leaves them on ListenAddr only.
+	OpsListenAddr string `yaml:"ops_listen_addr"`
 
+	Auth      Auth       `yaml:"auth"`
 	Providers []Provider `yaml:"providers"`
 	Routes    []Route    `yaml:"routes"`
 	Settings  Settings   `yaml:"settings"`
@@ -42,6 +54,69 @@ type Bootstrap struct {
 	ProfileBindings []BindingConfig `yaml:"profile_bindings"`
 	Budgets         []BudgetConfig  `yaml:"budgets"`
 	Limits          LimitsStore     `yaml:"limits"`
+}
+
+// Auth says how callers sign in, next to API keys.
+type Auth struct {
+	OIDC OIDC `yaml:"oidc"`
+}
+
+// OIDC accepts tokens from one OpenID Connect issuer. It is off while Issuer is empty.
+type OIDC struct {
+	// Issuer is the iss claim of the tokens, and where the discovery document is.
+	Issuer string `yaml:"issuer"`
+	// Audience must be among the aud claim of a token.
+	Audience string `yaml:"audience"`
+	// JWKSURL is where the signing keys are, for an issuer without a discovery document.
+	JWKSURL string `yaml:"jwks_url"`
+	// UserClaim holds the user id. Default sub.
+	UserClaim string `yaml:"user_claim"`
+	// TeamsClaim holds the user's teams. Default groups.
+	TeamsClaim string `yaml:"teams_claim"`
+	// RolesClaim holds the values RoleMapping reads.
+	RolesClaim string `yaml:"roles_claim"`
+	// RoleMapping gives admin, viewer or member to a value of RolesClaim.
+	RoleMapping map[string]string `yaml:"role_mapping"`
+	// ClockSkew is how far a token's exp and nbf may be off. Default 1m.
+	ClockSkew time.Duration `yaml:"clock_skew"`
+}
+
+// Enabled reports whether tokens from an OIDC issuer are accepted.
+func (o OIDC) Enabled() bool { return o.Issuer != "" }
+
+// validate checks the OIDC settings that can be checked without reaching the issuer.
+func (o OIDC) validate() error {
+	if !o.Enabled() {
+		if o.Audience != "" || o.JWKSURL != "" || o.RolesClaim != "" || len(o.RoleMapping) > 0 {
+			return errors.New("config: auth.oidc is set but auth.oidc.issuer is empty")
+		}
+		return nil
+	}
+	if u, err := url.Parse(o.Issuer); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("config: auth.oidc.issuer %q must be an http or https URL", o.Issuer)
+	}
+	if o.Audience == "" {
+		return errors.New("config: auth.oidc.audience is needed, so tokens issued for another service are refused")
+	}
+	if o.JWKSURL != "" {
+		if u, err := url.Parse(o.JWKSURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("config: auth.oidc.jwks_url %q must be an http or https URL", o.JWKSURL)
+		}
+	}
+	if len(o.RoleMapping) > 0 && o.RolesClaim == "" {
+		return errors.New("config: auth.oidc.role_mapping needs auth.oidc.roles_claim")
+	}
+	for value, role := range o.RoleMapping {
+		switch role {
+		case "admin", "viewer", "member":
+		default:
+			return fmt.Errorf("config: auth.oidc.role_mapping gives %q the role %q, which must be admin, viewer or member", value, role)
+		}
+	}
+	if o.ClockSkew < 0 {
+		return fmt.Errorf("config: auth.oidc.clock_skew %s must be positive", o.ClockSkew)
+	}
+	return nil
 }
 
 // ProfileConfig is a named set of limits in the shared mothership format.
@@ -64,7 +139,8 @@ type BudgetConfig struct {
 	LimitUSD float64 `yaml:"limit_usd"`
 }
 
-// LimitsStore says where limit counters are kept.
+// LimitsStore says where limit counters are kept: memory in this process, or sql in the Postgres
+// store so every replica shares them. Empty means sql with store.postgres and memory otherwise.
 type LimitsStore struct {
 	Store        string `yaml:"store"`
 	OnStoreError string `yaml:"on_store_error"`
@@ -161,7 +237,10 @@ type Provider struct {
 
 // Route sends the models matching Match to its targets.
 type Route struct {
-	Match   string   `yaml:"match"`
+	Match string `yaml:"match"`
+	// Allow lists who may use the route: user:<id>, team:<name>, key:<name> or role:<role>.
+	// Empty lets every authenticated caller in.
+	Allow   []string `yaml:"allow"`
 	Targets []Target `yaml:"targets"`
 }
 
@@ -177,9 +256,33 @@ type Store struct {
 	Postgres string `yaml:"postgres"`
 }
 
-// OTel configures trace export.
+// OTel configures trace export. It is off while Endpoint is empty.
 type OTel struct {
+	// Endpoint is the base URL of an OTLP/HTTP collector, such as http://collector:4318.
 	Endpoint string `yaml:"endpoint"`
+	// Headers are sent with every export, for a collector that needs a key.
+	Headers map[string]string `yaml:"headers"`
+	// SampleRatio is the share of traces that start at the gateway that are recorded, from 0
+	// to 1. Zero means all. A call that arrives with a traceparent follows its sampled flag.
+	SampleRatio float64 `yaml:"sample_ratio"`
+}
+
+// validate checks the trace export settings without reaching the collector.
+func (o OTel) validate() error {
+	if o.Endpoint == "" {
+		if len(o.Headers) > 0 || o.SampleRatio != 0 {
+			return errors.New("config: otel is set but otel.endpoint is empty")
+		}
+		return nil
+	}
+	if u, err := url.Parse(o.Endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		// The value is not repeated: it can hold a collector's key.
+		return errors.New("config: otel.endpoint must be an http or https URL of an OTLP/HTTP collector, usually port 4318; OTLP over gRPC is not supported")
+	}
+	if o.SampleRatio < 0 || o.SampleRatio > 1 {
+		return fmt.Errorf("config: otel.sample_ratio %v must be between 0 and 1", o.SampleRatio)
+	}
+	return nil
 }
 
 // Load reads the file at path, which may be empty, and applies TRANSPONDER_ overrides from environ.
@@ -193,12 +296,18 @@ func Load(path string, environ []string) (*Bootstrap, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading config: %w", err)
 		}
-		expanded, err := expand(string(raw), env)
+		doc, err := expand(raw, env)
 		if err != nil {
-			return nil, err
-		}
-		if err := yaml.Unmarshal([]byte(expanded), &tree); err != nil {
+			var missing missingVarsError
+			if errors.As(err, &missing) {
+				return nil, err
+			}
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
+		}
+		if doc.Kind != 0 {
+			if err := doc.Decode(&tree); err != nil {
+				return nil, fmt.Errorf("parsing %s: %w", path, err)
+			}
 		}
 		if tree == nil {
 			tree = map[string]any{}
@@ -236,27 +345,48 @@ func Load(path string, environ []string) (*Bootstrap, error) {
 	if c.Settings.Cooldown == 0 {
 		c.Settings.Cooldown = 30 * time.Second
 	}
+	if c.Auth.OIDC.Enabled() {
+		if c.Auth.OIDC.UserClaim == "" {
+			c.Auth.OIDC.UserClaim = "sub"
+		}
+		if c.Auth.OIDC.TeamsClaim == "" {
+			c.Auth.OIDC.TeamsClaim = "groups"
+		}
+		if c.Auth.OIDC.ClockSkew == 0 {
+			c.Auth.OIDC.ClockSkew = time.Minute
+		}
+	}
 	return c, c.validate()
 }
 
 func (c *Bootstrap) validate() error {
 	switch c.Limits.Store {
 	case "", "memory":
-	case "sql", "valkey":
-		return fmt.Errorf("config: limits.store %q is not supported yet; use memory", c.Limits.Store)
+	case "sql":
+		if c.Store.Postgres == "" {
+			return errors.New("config: limits.store sql keeps the counters in Postgres, so it needs store.postgres")
+		}
+	case "valkey":
+		return errors.New("config: limits.store valkey is not supported yet; use memory or sql")
 	default:
-		return fmt.Errorf("config: limits.store %q must be memory", c.Limits.Store)
+		return fmt.Errorf("config: limits.store %q must be memory or sql", c.Limits.Store)
 	}
 	switch c.Limits.OnStoreError {
 	case "", "local", "deny":
 	default:
 		return fmt.Errorf("config: limits.on_store_error %q must be local or deny", c.Limits.OnStoreError)
 	}
-	if _, err := c.LimitsConfig(); err != nil {
+	if err := c.Auth.OIDC.validate(); err != nil {
+		return err
+	}
+	if err := c.OTel.validate(); err != nil {
 		return err
 	}
 	if c.Store.SQLite != "" && c.Store.Postgres != "" {
 		return errors.New("config: set only one of store.sqlite and store.postgres")
+	}
+	if c.PreviousSecretsKey != "" && c.SecretsKey == "" && c.Store.Postgres != "" {
+		return errors.New("config: previous_secrets_key needs secrets_key, the key provider keys are sealed with from now on")
 	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":
@@ -275,6 +405,21 @@ func (c *Bootstrap) validate() error {
 	if c.Settings.RequestTimeout < 0 {
 		return fmt.Errorf("config: settings.request_timeout %s must be positive", c.Settings.RequestTimeout)
 	}
+	if err := c.ValidateRuntime(); err != nil {
+		return err
+	}
+	if len(c.Providers) > 0 && len(c.Routes) == 0 {
+		return errors.New("config: providers are declared but no routes send models to them")
+	}
+	return nil
+}
+
+// ValidateRuntime checks the part of the config a reload swaps: providers, routes, profiles,
+// bindings and budgets, wherever they came from.
+func (c *Bootstrap) ValidateRuntime() error {
+	if _, err := c.LimitsConfig(); err != nil {
+		return err
+	}
 	names := map[string]bool{}
 	for i, p := range c.Providers {
 		switch {
@@ -292,15 +437,15 @@ func (c *Bootstrap) validate() error {
 		}
 		names[p.Name] = true
 	}
-	if len(c.Providers) > 0 && len(c.Routes) == 0 {
-		return errors.New("config: providers are declared but no routes send models to them")
-	}
 	for i, r := range c.Routes {
 		if r.Match == "" {
 			return fmt.Errorf("config: routes[%d] has no match", i)
 		}
 		if len(r.Targets) == 0 {
 			return fmt.Errorf("config: route %q has no targets", r.Match)
+		}
+		if _, err := router.ParseAccess(r.Allow); err != nil {
+			return fmt.Errorf("config: route %q: %w", r.Match, err)
 		}
 		for _, t := range r.Targets {
 			if !names[t.Provider] {
@@ -309,6 +454,11 @@ func (c *Bootstrap) validate() error {
 		}
 	}
 	return nil
+}
+
+// SharedLimits reports whether limit counters are kept in Postgres, shared by every replica.
+func (c *Bootstrap) SharedLimits() bool {
+	return c.Limits.Store == "sql" || (c.Limits.Store == "" && c.Store.Postgres != "")
 }
 
 func envMap(environ []string) map[string]string {
@@ -321,189 +471,80 @@ func envMap(environ []string) map[string]string {
 	return m
 }
 
-// expand replaces ${VAR} and $VAR from env. Load does this before YAML parsing.
-// A line whose first non-space character is # is a comment and is copied
-// unchanged, so a commented-out key does not require its variable. Inside a
-// literal (|) or folded (>) block that line is part of the value, so it is
-// expanded with the rest of the block. The block runs until a non-empty line
-// is indented no further than its parent: the key, or the "-" or "?" when the
-// block is that entry's whole value.
-func expand(s string, env map[string]string) (string, error) {
-	var missing []string
-	mapping := func(name string) string {
-		v, ok := env[name]
+// missingVarsError names the variables a file uses that the environment does not set.
+type missingVarsError []string
+
+func (e missingVarsError) Error() string {
+	return "config: environment variables not set: " + strings.Join(e, ", ")
+}
+
+// expand parses raw as YAML and replaces ${VAR} and $VAR in its scalars, keys
+// included, from env. Each variable is first swapped for a marker made of
+// letters and digits, so it parses the same in any YAML context, and only the
+// markers left in scalars are filled in. Comments are never expanded, and a
+// value is used as written: a # or a newline in it stays part of the value.
+// A variable fills part of one scalar; it cannot add keys or list items.
+func expand(raw []byte, env map[string]string) (*yaml.Node, error) {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	prefix := "tpenv" + hex.EncodeToString(nonce[:]) + "n"
+	var names []string
+	marked := os.Expand(string(raw), func(name string) string {
+		names = append(names, name)
+		return prefix + strconv.Itoa(len(names)-1) + "x"
+	})
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(marked), &doc); err != nil {
+		return nil, err
+	}
+	if len(names) == 0 {
+		return &doc, nil
+	}
+	marker := regexp.MustCompile(prefix + `([0-9]+)x`)
+	missing := map[string]bool{}
+	fill := func(m string) string {
+		i, err := strconv.Atoi(m[len(prefix) : len(m)-1])
+		if err != nil || i >= len(names) {
+			return m
+		}
+		v, ok := env[names[i]]
 		if !ok {
-			missing = append(missing, name)
+			missing[names[i]] = true
 		}
 		return v
 	}
-	var b strings.Builder
-	b.Grow(len(s))
-	blockAt := -1
-	for s != "" {
-		line, rest, more := strings.Cut(s, "\n")
-		body, cr := splitCR(line)
-		if blockAt >= 0 {
-			n, blank := leadingIndent(body)
-			if blank || n > blockAt {
-				if blank {
-					b.WriteString(line)
-				} else {
-					b.WriteString(os.Expand(body, mapping))
-					b.WriteString(cr)
-				}
-				if !writeNL(&b, more) {
-					break
-				}
-				s = rest
-				continue
+	var walk func(n *yaml.Node)
+	walk = func(n *yaml.Node) {
+		switch n.Kind {
+		case yaml.ScalarNode:
+			if !strings.Contains(n.Value, prefix) {
+				return
 			}
-			blockAt = -1
+			n.Value = marker.ReplaceAllStringFunc(n.Value, fill)
+			// A plain scalar is typed again from its new value, so ${PORT} can still be a number.
+			if n.Style&(yaml.TaggedStyle|yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle|yaml.LiteralStyle|yaml.FoldedStyle) == 0 {
+				n.Tag = ""
+			}
+		case yaml.AliasNode:
+			// The anchored node is expanded where it is defined.
+		default:
+			for _, c := range n.Content {
+				walk(c)
+			}
 		}
-		if indent, commentAt, ok := blockHeader(body); ok {
-			blockAt = indent
-			b.WriteString(expandBlockHeader(body, commentAt, mapping))
-			b.WriteString(cr)
-		} else if yamlComment(body) {
-			b.WriteString(line)
-		} else {
-			b.WriteString(os.Expand(body, mapping))
-			b.WriteString(cr)
-		}
-		if !writeNL(&b, more) {
-			break
-		}
-		s = rest
 	}
+	walk(&doc)
 	if len(missing) > 0 {
-		sort.Strings(missing)
-		return "", fmt.Errorf("config: environment variables not set: %s", strings.Join(missing, ", "))
-	}
-	return b.String(), nil
-}
-
-func writeNL(b *strings.Builder, more bool) bool {
-	if !more {
-		return false
-	}
-	b.WriteByte('\n')
-	return true
-}
-
-func splitCR(line string) (body, cr string) {
-	if strings.HasSuffix(line, "\r") {
-		return strings.TrimSuffix(line, "\r"), "\r"
-	}
-	return line, ""
-}
-
-func leadingIndent(body string) (n int, blank bool) {
-	i := 0
-	for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
-		i++
-	}
-	return i, i == len(body)
-}
-
-// blockHeader reports whether body opens a literal or folded block scalar.
-// indent is the parent column content must pass: the key's column, or the
-// column of "-" or "?" when the block is that entry's whole value. commentAt
-// is the index of a trailing comment, or -1 when the header has none. A "|"
-// or ">" that is only part of a plain value is not a header.
-func blockHeader(body string) (indent, commentAt int, ok bool) {
-	i := 0
-	for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
-		i++
-	}
-	rest := body[i:]
-	if rest == "" || rest[0] == '#' {
-		return 0, 0, false
-	}
-	if (rest[0] == '-' || rest[0] == '?') && len(rest) > 1 && (rest[1] == ' ' || rest[1] == '\t') {
-		markerCol := i
-		rest = strings.TrimLeft(rest[1:], " \t")
-		if rest == "" {
-			return 0, 0, false
+		out := make(missingVarsError, 0, len(missing))
+		for name := range missing {
+			out = append(out, name)
 		}
-		if rel, isBlock := blockIndicator(rest); isBlock {
-			return markerCol, commentIndex(body, rest, rel), true
-		}
-		return keyBlock(body, rest, len(body)-len(rest))
+		sort.Strings(out)
+		return nil, out
 	}
-	return keyBlock(body, rest, i)
-}
-
-func keyBlock(body, rest string, keyCol int) (indent, commentAt int, ok bool) {
-	if rel, isBlock := blockIndicator(rest); isBlock {
-		return keyCol, commentIndex(body, rest, rel), true
-	}
-	colon := strings.IndexByte(rest, ':')
-	if colon < 0 || colon+1 >= len(rest) || (rest[colon+1] != ' ' && rest[colon+1] != '\t') {
-		return 0, 0, false
-	}
-	val := strings.TrimLeft(rest[colon+1:], " \t")
-	rel, isBlock := blockIndicator(val)
-	if !isBlock {
-		return 0, 0, false
-	}
-	return keyCol, commentIndex(body, val, rel), true
-}
-
-func commentIndex(body, val string, rel int) int {
-	if rel < 0 {
-		return -1
-	}
-	return len(body) - len(val) + rel
-}
-
-// blockIndicator reports whether s is a block scalar indicator, such as "|",
-// "|-", ">+" or "|2". commentAt is the index of a trailing # comment in s, or
-// -1 when there is none. The # may sit against the indicator, as in "|# note".
-func blockIndicator(s string) (commentAt int, ok bool) {
-	if s == "" || (s[0] != '|' && s[0] != '>') {
-		return 0, false
-	}
-	i := 1
-	var chomp, digit bool
-	for i < len(s) {
-		c := s[i]
-		if (c == '-' || c == '+') && !chomp {
-			chomp = true
-			i++
-			continue
-		}
-		if c >= '1' && c <= '9' && !digit {
-			digit = true
-			i++
-			continue
-		}
-		break
-	}
-	j := i
-	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
-		j++
-	}
-	if j == len(s) {
-		return -1, true
-	}
-	if s[j] == '#' {
-		return j, true
-	}
-	return 0, false
-}
-
-func expandBlockHeader(body string, commentAt int, mapping func(string) string) string {
-	if commentAt < 0 {
-		return os.Expand(body, mapping)
-	}
-	return os.Expand(body[:commentAt], mapping) + body[commentAt:]
-}
-
-// yamlComment reports whether line is a YAML comment. The # has to be the first
-// non-space character. A # later in a value is not a comment to this pass, and
-// expand does not use this for a line inside a | or > block.
-func yamlComment(line string) bool {
-	return strings.HasPrefix(strings.TrimLeft(line, " \t\r"), "#")
+	return &doc, nil
 }
 
 func applyEnv(tree map[string]any, environ []string) {
@@ -514,7 +555,7 @@ func applyEnv(tree map[string]any, environ []string) {
 			continue
 		}
 		name := strings.ToLower(k[len(envPrefix):])
-		kind, isKnown := known[name]
+		typ, isKnown := known[name]
 		if !isKnown {
 			continue
 		}
@@ -528,24 +569,38 @@ func applyEnv(tree map[string]any, environ []string) {
 			}
 			node = child
 		}
+		// Left as a string when it does not parse, so the error names what was set.
 		var value any = v
-		if kind == reflect.Bool {
+		switch typ.Kind() {
+		case reflect.Bool:
 			if b, err := strconv.ParseBool(v); err == nil {
 				value = b
+			}
+		case reflect.Float64:
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				value = f
+			}
+		case reflect.Int, reflect.Int64:
+			// A duration stays a string such as "30s".
+			if typ != reflect.TypeFor[time.Duration]() {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+					value = n
+				}
 			}
 		}
 		node[path[len(path)-1]] = value
 	}
 }
 
-func leafPaths(t reflect.Type, prefix string) map[string]reflect.Kind {
-	out := map[string]reflect.Kind{}
+func leafPaths(t reflect.Type, prefix string) map[string]reflect.Type {
+	out := map[string]reflect.Type{}
 	for f := range t.Fields() {
 		tag, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
 		if tag == "" || tag == "-" {
 			continue
 		}
-		if f.Type.Kind() == reflect.Slice {
+		// A list or a map has no single value an environment variable could carry.
+		if f.Type.Kind() == reflect.Slice || f.Type.Kind() == reflect.Map {
 			continue
 		}
 		if f.Type.Kind() == reflect.Struct {
@@ -554,7 +609,7 @@ func leafPaths(t reflect.Type, prefix string) map[string]reflect.Kind {
 			}
 			continue
 		}
-		out[prefix+tag] = f.Type.Kind()
+		out[prefix+tag] = f.Type
 	}
 	return out
 }

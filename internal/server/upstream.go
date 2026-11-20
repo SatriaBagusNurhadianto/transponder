@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"github.com/raven-clown/transponder/internal/dialect/openai"
 	"github.com/raven-clown/transponder/internal/provider"
 	"github.com/raven-clown/transponder/internal/router"
+	"github.com/raven-clown/transponder/internal/schema"
 	"github.com/raven-clown/transponder/internal/tokens"
 )
 
@@ -62,15 +64,18 @@ func (g *gateway) run(c *call, attempt func() error) {
 	failedAt := 0
 	for i, t := range c.plan.Targets {
 		g.use(c, t, i)
+		try := g.try(c, i)
 		err := attempt()
 		if err == nil {
+			try.answered()
 			// A stream that broke after its first byte cannot fall back, but it still counts
-			// against the target, unless it broke because the caller left.
+			// against the target, unless it broke because the caller left. One that stalled
+			// until the request timeout counts.
 			switch {
 			case !c.cut:
-				g.d.Router.Report(t, true)
-			case ctx.Err() == nil:
-				g.d.Router.Report(t, false)
+				c.router.Report(t, true)
+			case !callerGone(c):
+				c.router.Report(t, false)
 			}
 			return
 		}
@@ -80,16 +85,20 @@ func (g *gateway) run(c *call, attempt func() error) {
 		}
 		if ae.input {
 			input = ae
+			try.skipped()
+			g.fellBack(c, i, "unsupported")
 			continue
 		}
+		try.failed(ae.err)
 		upstream, failedTarget, failedAt = ae, t, i
 		if ctx.Err() != nil || !retryable(ae.err) {
 			break
 		}
-		g.d.Router.Report(t, false)
+		c.router.Report(t, false)
 		if i < len(c.plan.Targets)-1 {
 			g.d.Logger.WarnContext(ctx, "falling back", "route", c.plan.Route, "provider", c.rec.Provider, "model", t.Model, "err", ae.err)
 		}
+		g.fellBack(c, i, fallbackReason(ae.err))
 	}
 	switch {
 	case upstream != nil:
@@ -119,6 +128,13 @@ func (g *gateway) rejected(c *call, err error) {
 // the caller's dialect is passed on as is, since it would fail the same way anywhere.
 func (g *gateway) upstreamFailed(c *call, err error, sameDialect bool) {
 	ctx := c.r.Context()
+	if callerGone(c) {
+		g.d.Logger.InfoContext(ctx, "caller left before the answer", "provider", c.rec.Provider)
+		c.w.WriteHeader(statusCallerGone)
+		c.rec.Status = statusCallerGone
+		g.recordCall(ctx, c)
+		return
+	}
 	g.d.Logger.WarnContext(ctx, "provider call failed", "provider", c.rec.Provider, "err", err)
 	var pe *provider.Error
 	switch {
@@ -137,13 +153,49 @@ func (g *gateway) upstreamFailed(c *call, err error, sameDialect bool) {
 		c.fail(c.w, http.StatusBadGateway, "api_error", "upstream_too_large", "", "the provider's response is larger than 64 MiB; ask for fewer inputs or base64 encoding")
 		c.rec.Status = http.StatusBadGateway
 	case errors.Is(err, provider.ErrUnsupported):
-		c.fail(c.w, http.StatusBadRequest, "invalid_request_error", "unsupported", "model", "the provider for this model cannot serve this request")
+		msg := "the provider for this model cannot serve this request"
+		// Name the content that could not be carried, so the caller knows what to change.
+		var ce *schema.ContentError
+		if errors.As(err, &ce) {
+			msg += ": " + ce.Reason
+		}
+		c.fail(c.w, http.StatusBadRequest, "invalid_request_error", "unsupported", "model", msg)
 		c.rec.Status = http.StatusBadRequest
 	default:
 		c.fail(c.w, http.StatusBadGateway, "api_error", "upstream_error", "", "the provider did not answer")
 		c.rec.Status = http.StatusBadGateway
 	}
 	g.recordCall(ctx, c)
+}
+
+// statusCallerGone records a call whose caller closed the connection before the answer ended,
+// as nginx does.
+const statusCallerGone = 499
+
+// callerGone reports whether the caller hung up. A request that ran out of time ends with
+// DeadlineExceeded instead, and counts as the provider's failure.
+func callerGone(c *call) bool {
+	return errors.Is(c.r.Context().Err(), context.Canceled)
+}
+
+// streamBroke handles a stream that stopped before its end, after the caller had its first
+// byte. It reports whether to send the caller an error event; a caller who left gets none.
+func (g *gateway) streamBroke(ctx context.Context, c *call, err error) bool {
+	c.cut = true
+	if callerGone(c) {
+		g.d.Logger.InfoContext(ctx, "caller left in the middle of the stream", "provider", c.rec.Provider)
+		return false
+	}
+	g.d.Logger.WarnContext(ctx, "upstream stream broke", "provider", c.rec.Provider, "err", err)
+	return true
+}
+
+// streamStatus is the status recorded for a stream that began.
+func streamStatus(c *call) int {
+	if c.cut && callerGone(c) {
+		return statusCallerGone
+	}
+	return http.StatusOK
 }
 
 var errUpstreamTooLarge = errors.New("the provider's response is larger than the gateway accepts")

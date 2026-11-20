@@ -4,7 +4,7 @@ Instructions for coding agents working in this repository. Keep this file curren
 
 ## Project
 
-transponder is an LLM gateway in one Go binary. It serves OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` and Anthropic-compatible `/v1/messages` in front of Anthropic, OpenAI, Gemini and Ollama, falls back across providers, records usage and cost per user, and enforces budgets. Its configuration lives in SQL and is managed through a JSON admin API under `/admin/v1/`. It is used by teams that want per-user model spend and limits from their existing OIDC provider, and by the other mothership projects for chat and embeddings. The design is in `docs/design.md`.
+transponder is an LLM gateway in one Go binary. It serves OpenAI-compatible `/v1/chat/completions`, `/v1/responses` (a passthrough to OpenAI-dialect targets) and `/v1/embeddings` and Anthropic-compatible `/v1/messages` in front of Anthropic, OpenAI, Gemini and Ollama, falls back across providers, records usage and cost per user, and enforces budgets. Its configuration lives in SQL and is managed through a JSON admin API under `/admin/v1/`. It is used by teams that want per-user model spend and limits from their existing OIDC provider, and by the other mothership projects for chat and embeddings. The design is in `docs/design.md`.
 
 It is one of four projects described in the shared contract at https://github.com/raven-clown/mothership/blob/main/CONTRACT.md. Follow the contract. A change to how the projects connect goes to the contract first.
 
@@ -24,7 +24,23 @@ go run ./cmd/transponder
 go run ./cmd/transponder --config transponder.yaml
 ```
 
+Run the demo and check it (Docker with Compose v2):
+
+```shell
+cd demo && docker compose up --build -d --wait && ./check.sh
+docker compose down -v
+```
+
+Measure speed (see `docs/benchmarks.md`): the Go benchmarks of the hot paths, and the load suite against a built binary:
+
+```shell
+go test -run '^$' -bench . -benchmem ./internal/...
+go build -o transponder ./cmd/transponder && go run ./bench run -bin ./transponder -count 3
+```
+
 On Windows without gcc, `-race` is not available: run `go test ./...` locally and let CI run the race detector.
+
+Tests that need Postgres are skipped unless `TRANSPONDER_TEST_POSTGRES` holds the URL of a server, such as `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable`. Each test works in a schema of its own and drops it. CI sets the variable in the coverage job.
 
 ## Layout
 
@@ -32,26 +48,34 @@ Planned in `docs/design.md` section 4. Packages marked (planned) do not exist ye
 
 - `cmd/transponder`: main, flags, bootstrap config, server start
 - `internal/config`: bootstrap YAML, env overrides, and the providers and routes declared in the file
-- `internal/auth`: OIDC JWT verification, API keys, identity and roles
+- `internal/auth`: OIDC JWT verification with a cached JWKS, API keys, identity and roles; `internal/auth/authtest` is a local OIDC provider for tests
 - `internal/server`: HTTP mux, middleware, gateway handlers
-- `internal/admin` (planned): `/admin/v1` handlers, pagination, audit writes
+- `internal/admin`: `/admin/v1` handlers, pagination, `If-Match` versions and audit writes. Every write goes through `commit`, which runs it with its audit record in one `UpdateConfig` and then reloads. `spec_test.go` checks that the served routes and `api/openapi.yaml` match both ways and validates every response the tests get against the file, so a new endpoint goes in the file first
 - `internal/schema`: canonical request, response, stream and usage types
 - `internal/dialect/openai`, `internal/dialect/anthropic`, `internal/dialect/gemini`: each wire format to and from the canonical types, in both directions, with usage parsing
 - `internal/sse`: server-sent event reading and writing shared by the dialects
 - `internal/router`: routes, the plan of targets for a call and the cooldown of failing ones; access per route is planned
 - `internal/provider`, `internal/provider/<name>`: the Provider interface, the shared `Error` type and one adapter per backend; `providertest` (planned) is the conformance suite
-- `internal/provider/registry`: every provider type in one list. A new provider is a package under `internal/provider` plus one entry there; config validation, `buildRouter` and the free flag for pricing all read it
-- `internal/store`, `internal/store/sqlite`: store interfaces, SQLite with embedded migrations in `internal/store/sqlite/migrations`
+- `internal/provider/registry`: every provider type in one list. A new provider is a package under `internal/provider` plus one entry there; config validation, `buildRouter` and the free flag for pricing all read it. `TestReadmeProviderTable` builds every type and fails until the README's provider table has its row, with the dialect, default base URL and capabilities the adapter really has
+- `internal/store`, `internal/store/sqlite`, `internal/store/postgres`: store interfaces, and SQLite and Postgres (through `pgx`) behind them, each with embedded migrations in its own `migrations` directory
+- `internal/store/storetest`: the test suite both stores pass, and the check that migrations follow expand and contract. `internal/store/postgres/pgtest` gives a test an empty Postgres schema
 - `internal/pricing`: the embedded price table in `prices.yaml` and cost math in nano-USD
-- `internal/limits`: profiles, budgets and the limiter (reserve, then settle), with counters behind a `Store` interface; only the memory store exists so far
+- `internal/limits`: profiles, budgets and the limiter (reserve, then settle), with counters behind a `Store` interface: `MemoryStore` in one process, `Failover` for `on_store_error`, and the shared one in `internal/store/postgres/counters.go`. `internal/limits/limitstest` is the suite every counter store passes
 - `internal/tokens`: the token estimate used when a provider reports no usage
-- `internal/runtime`, `internal/secrets`, `internal/telemetry` (planned): live config, sealed secrets, logs and metrics
+- `internal/runtime`: the live config and its reload. Each replica checks `config_version` every 2 seconds and swaps in a new snapshot; a call keeps the snapshot it started with. A write to the runtime config goes through `store.ConfigStore.UpdateConfig`, which raises the version in the same transaction
+- `internal/telemetry`: the JSON logger, the Prometheus registry and gateway metrics served on `/metrics`, and the tracer with its OTLP/HTTP exporter. `internal/server/observe.go` is where requests, attempts and fallbacks are reported to them. Nothing that goes on a span or a label may hold prompt, completion or provider error text
+- `internal/secrets`: provider keys sealed with AES-256-GCM under `secrets_key`, bound to the item they belong to. With SQLite and no `secrets_key`, `transponder.key` next to the database holds a generated one
+- Runtime config in the store: providers, routes, budgets and profiles are rows of `config_items` (kind, id, JSON body, sealed secret, version, source). At start `admin.SyncFile` writes the file's items there as `source: file`, and every reload builds the router and limits from `admin.Runtime`, which reads the store and keeps the file's provider keys out of it. An admin write that would leave a config `Runtime` cannot load is rolled back with 400 `invalid_config`
 - `internal/testutil` (planned): shared fakes
-- `api/openapi.yaml` (planned): the admin API description
+- `api/openapi.yaml`: the admin API description, embedded by package `api` and served at `/admin/v1/openapi.yaml`
+- `bench/`: the load suite, a fake upstream with fixed latency and body size and a fixed-rate load tool; not part of the gateway. Hot-path Go benchmarks live next to their code in `*_bench_test.go` and use only APIs v0.2.4 has too, so the same files run on the old tag. `cmd/transponder/pprof.go` serves pprof only in a build with `-tags pprof`
+- `docs/`: `design.md` is the approved plan, `architecture.md` the code as built and why, `configuration.md` every config key. `TestConfigReference` in `internal/config` fails when a key, its environment variable or its default is missing from `configuration.md`, and `TestDocsConfigExamples` in `cmd/transponder` loads every YAML example in it with `--config-test`
+- `demo/`: the Docker Compose demo with Prometheus, Grafana and Jaeger. `demo/sim` is its fake provider, key seeder and traffic, and is not part of the gateway. A change to a metric name or label must keep `demo/grafana/dashboards/transponder.json` working; `go test ./demo/...` checks every query names a metric the gateway serves, and the `demo` CI job runs the stack
 
 ## Rules
 
 - Follow CONTRIBUTING.md: tests with every change, a failing test first for a bug fix, table-driven tests, no network in unit tests, no bare `time.Sleep`.
+- A schema change adds the next numbered migration to `internal/store/sqlite/migrations` and `internal/store/postgres/migrations`, to both unless the table is used by one store only (the shared limit counters live only in Postgres). A store method is added to both stores and to the suite in `internal/store/storetest`. Migrations follow expand and contract: one only adds tables, indexes and columns that are nullable or have a default. A removal or rename waits for a later release and starts with `-- contract: <what and why>`.
 - Commit after every change, with a Conventional Commits message, and push it.
 - Never commit straight to `main`. Start each piece of work on its own branch off `main`, named `feat/<topic>`, `fix/<topic>`, `ci/<topic>` or `docs/<topic>`, and push it after every commit.
 - When the work is done, open a pull request with a Conventional Commits title and a plain English description. Wait until every required check is green: the three test jobs, coverage, lint, analyze, dependency review and pr title. A macOS job cancelled while waiting for a runner is not a failure: rerun it with `gh run rerun <id> --failed`.

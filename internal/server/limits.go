@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"math"
 	"net/http"
 	"regexp"
@@ -18,7 +19,7 @@ import (
 // admit reserves the call against the caller's limits once the model is known, and writes the
 // refusal itself when the call may not run.
 func (g *gateway) admit(c *call, est limits.Estimate) bool {
-	if g.d.Limiter == nil {
+	if c.limiter == nil {
 		return true
 	}
 	// Any target of the route may end up serving the call, so the reservation is priced at the
@@ -34,8 +35,9 @@ func (g *gateway) admit(c *call, est limits.Estimate) bool {
 		}
 		return dearest
 	}
-	t, d := g.d.Limiter.Admit(c.r.Context(), c.caller, est)
+	t, d := c.limiter.Admit(c.r.Context(), c.caller, est)
 	if d != nil {
+		g.d.Metrics.Limited(d.Code)
 		if d.RetryAfter > 0 {
 			c.w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(d.RetryAfter.Seconds())), 10))
 		}
@@ -45,6 +47,8 @@ func (g *gateway) admit(c *call, est limits.Estimate) bool {
 			errType = "rate_limit_error"
 		case http.StatusPaymentRequired:
 			errType = "insufficient_quota"
+		case http.StatusServiceUnavailable:
+			errType = "server_error"
 		}
 		c.fail(c.w, d.Status, errType, d.Code, "", d.Message)
 		return false
@@ -63,7 +67,8 @@ func (c *call) done() {
 
 // recordCall settles the call's reservations to its real usage and stores the usage record.
 func (g *gateway) recordCall(ctx context.Context, c *call) {
-	if c.ticket != nil && c.r.Context().Err() != nil && c.rec.Status >= http.StatusInternalServerError {
+	beforeAnswer := c.rec.Status >= http.StatusInternalServerError || (c.rec.Status == statusCallerGone && !c.cut)
+	if c.ticket != nil && c.r.Context().Err() != nil && beforeAnswer {
 		// The caller left before the answer; the provider may still have done and billed the work.
 		c.ticket.Keep()
 	}
@@ -77,10 +82,21 @@ func (g *gateway) recordCall(ctx context.Context, c *call) {
 // requestedMax reads the largest number among fields, since providers disagree on which of
 // max_tokens and max_completion_tokens wins.
 func requestedMax(body []byte, fields ...string) int64 {
+	return maxField(topFields(body), fields...)
+}
+
+// topFields is the body's top-level object, or nil when the body is not one. Reading it once
+// serves every maxField a call needs.
+func topFields(body []byte) map[string]json.RawMessage {
 	var m map[string]json.RawMessage
 	if json.Unmarshal(body, &m) != nil {
-		return 0
+		return nil
 	}
+	return m
+}
+
+// maxField is requestedMax on fields already read.
+func maxField(m map[string]json.RawMessage, fields ...string) int64 {
 	// Keys are matched without regard to case, as servers written in Go read them.
 	var out int64
 	for k, raw := range m {
@@ -205,23 +221,25 @@ const minThinkingBudget = 1024
 
 // estimateInput counts every key and string in a request body, and every number in an array,
 // which is how token-array inputs arrive. Tool schemas, tool arguments and descriptions all reach
-// the model, so they all count. Base64 payloads and signatures do not.
+// the model, so they all count. Signatures do not, and neither does an image's base64 data: an
+// image counts as tokens.Image instead, whatever its size. Other inline files, such as a PDF,
+// count by the size of their data, since the model reads their pages.
 func estimateInput(body []byte) int64 {
 	var v any
 	if json.Unmarshal(body, &v) != nil {
 		return tokens.Estimate(string(body))
 	}
 	var b bytes.Buffer
-	var numbers int64
+	var numbers, images int64
 	var walk func(key string, v any)
 	walk = func(key string, v any) {
 		switch x := v.(type) {
 		case map[string]any:
+			if isImage(x) {
+				images++
+				x = withoutImageData(x)
+			}
 			for k, val := range x {
-				// Only a base64 source's data is binary; a text document keeps its text there.
-				if k == "data" && x["type"] == "base64" {
-					continue
-				}
 				b.WriteString(k)
 				b.WriteByte(' ')
 				walk(k, val)
@@ -235,7 +253,7 @@ func estimateInput(body []byte) int64 {
 				walk(key, val)
 			}
 		case string:
-			if key == "signature" || base64DataURI.MatchString(x) {
+			if key == "signature" {
 				return
 			}
 			b.WriteString(x)
@@ -243,5 +261,48 @@ func estimateInput(body []byte) int64 {
 		}
 	}
 	walk("", v)
-	return tokens.Estimate(b.String()) + numbers
+	return tokens.Estimate(b.String()) + numbers + images*tokens.Image
+}
+
+// withoutImageData returns an image part without the fields that hold its inline data: an
+// Anthropic base64 source's data, and a data: URL in image_url or file_data. Anything else
+// in the part still counts.
+func withoutImageData(part map[string]any) map[string]any {
+	out := maps.Clone(part)
+	if src, ok := out["source"].(map[string]any); ok && src["type"] == "base64" {
+		src = maps.Clone(src)
+		delete(src, "data")
+		out["source"] = src
+	}
+	if u, ok := out["image_url"].(map[string]any); ok && isDataURI(u["url"]) {
+		u = maps.Clone(u)
+		delete(u, "url")
+		out["image_url"] = u
+	}
+	for _, k := range []string{"image_url", "file_data"} {
+		if isDataURI(out[k]) {
+			delete(out, k)
+		}
+	}
+	return out
+}
+
+func isDataURI(v any) bool {
+	s, ok := v.(string)
+	return ok && base64DataURI.MatchString(s)
+}
+
+// isImage reports whether a JSON object is an image part, in the form of OpenAI's chat or
+// Responses API or of Anthropic. A Responses API file counts as one image too: its size cannot
+// be read before the call, and callers with an input limit may not send one.
+func isImage(part map[string]any) bool {
+	switch part["type"] {
+	case "input_image", "input_file":
+		return true
+	case "image_url":
+		return part["image_url"] != nil
+	case "image":
+		return part["source"] != nil
+	}
+	return false
 }

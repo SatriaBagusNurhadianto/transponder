@@ -76,6 +76,8 @@ Not in v1: a UI of any kind (the contract puts that in the separate console), se
 
 ## 4. Architecture
 
+This section is the plan as it was approved. [architecture.md](architecture.md) describes the code as it is built, with the reasons behind each pattern, for a contributor reading it for the first time.
+
 ```
 client (OpenAI or Anthropic dialect)
    |
@@ -230,7 +232,7 @@ routes:
 
 - The request's `model` is matched against routes by `position`, lowest first. `match` is an exact name or a glob. The first route that matches wins.
 - A target without `model` keeps the model the caller asked for.
-- `allow` lists who may use the route: `user:<id>`, `team:<name>` or `key:<name>`. Empty means every authenticated caller. A caller outside the list gets 403 `route_forbidden`. This is the "give someone access" task in the console.
+- `allow` lists who may use the route: `user:<id>`, `team:<name>`, `key:<name>` or `role:<role>`, where a role entry also admits the roles above it. Empty means every authenticated caller. `/v1/models` lists only the routes a caller may use. A caller outside the list gets 403 `route_forbidden`. This is the "give someone access" task in the console.
 - With the `allow_direct` setting, `provider/model` (for example `local/llama3.2`) goes straight to that provider with no fallback. Only admins may use it when any route has a non-empty `allow`, so direct calls cannot get around access rules.
 - No match gives 404 `model_not_found`.
 - Route names are stable aliases, as the contract says. Other projects ask for a role, such as logbook's `memory-extract`, and the admin decides which provider serves it. Renaming a route through the admin API is allowed but logged in the audit as a breaking change.
@@ -238,9 +240,9 @@ routes:
 
 A target is retried on the next one when the call fails with a connection error, a timeout, 408, 429, any 5xx, Anthropic's 529, or 401 and 403 from the upstream (that means transponder's provider key is bad, which is not the caller's fault). It is not retried on other 4xx: a bad request stays bad on every provider.
 
-Cooldown: after 3 failures in a row a target is put last in its routes for 30 seconds (`settings.cooldown_failures` and `settings.cooldown`). It is still tried once every other target has failed, and one more failure after the cooldown starts it again. A success clears it. A stream that breaks after its first byte cannot fall back but counts as a failure; a caller who leaves, a request the provider rejects as wrong and a target that cannot take the request do not. The state is keyed by provider and upstream model. Cooldown state is kept per replica in memory; it is a short-lived signal and sharing it is not worth a round trip. There is no retry of the same target in v1; fallback is the retry.
+Cooldown: after 3 failures in a row a target is put last in its routes for 30 seconds (`settings.cooldown_failures` and `settings.cooldown`). It is still tried once every other target has failed, and one more failure after the cooldown starts it again. A success clears it. A stream that breaks after its first byte, or stalls until `request_timeout`, cannot fall back but counts as a failure; a caller who leaves, a request the provider rejects as wrong and a target that cannot take the request do not. The state is keyed by provider and upstream model. Cooldown state is kept per replica in memory; it is a short-lived signal and sharing it is not worth a round trip. There is no retry of the same target in v1; fallback is the retry.
 
-Streaming: transponder reads the upstream until its first event before writing anything to the client. A failure before that point falls back like any other call. After the first byte is sent the target is committed, and a later failure ends the stream with an error event in the caller's dialect.
+Streaming: transponder reads the upstream until its first output before writing anything to the client. Events that carry no output (a role chunk, `message_start`, a ping, `response.created`, at most 64 of them) are held back until then. A failure before that point, such as Anthropic's `overloaded_error` right after `message_start`, falls back like any other call. After the first byte is sent the target is committed, and a later failure ends the stream with an error event in the caller's dialect.
 
 Each streamed attempt has a timeout (`attempt_timeout`, default 60s until the first event) and every request has `request_timeout` (default 10m, since long generations are normal). A call that is not streamed has only the request timeout: its headers arrive once the whole answer is generated, so an attempt clock would cut long answers.
 
@@ -248,7 +250,7 @@ Each streamed attempt has a timeout (`attempt_timeout`, default 60s until the fi
 
 Every request, gateway or admin, needs a caller, as the contract says:
 
-- `Authorization: Bearer <token>`. If the token is a JWT it is verified against the configured OIDC issuer (JWKS fetched and cached through `coreos/go-oidc`), audience checked. Otherwise it is looked up as an API key.
+- `Authorization: Bearer <token>`. If the token is a JWT it is verified against the configured OIDC issuer (JWKS fetched and cached in `internal/auth`, signatures checked with `go-jose`), audience checked. Otherwise it is looked up as an API key.
 - `x-api-key: <token>` is accepted the same way, because Anthropic clients send that header when given an API key.
 
 The result is an `Identity{User, Teams, Key, Role}`. There are three roles:
@@ -275,18 +277,21 @@ The bootstrap file:
 
 ```yaml
 listen_addr: ":8080"
+# ops_listen_addr: ":9464"   # /healthz, /readyz and /metrics on a second port
 store:
   sqlite: ./transponder.db
   # postgres: postgres://...
 secrets_key: ${TRANSPONDER_SECRETS_KEY}
 otel:
-  endpoint: ""
+  endpoint: ""               # an OTLP/HTTP collector, such as http://collector:4318
+  # headers: {Authorization: Bearer ...}
+  # sample_ratio: 1
 log_level: info
 ```
 
 Any key can be overridden by environment variable, with `__` between nested keys as the contract says: `TRANSPONDER_LISTEN_ADDR` for `listen_addr`, `TRANSPONDER_STORE__POSTGRES` for `store.postgres`.
 
-A `${VAR}` in the file is replaced from the environment before parsing. A missing variable is an error that names it. A comment line, whose first non-space character is `#`, is left unchanged. A line that starts with `#` inside a `|` or `>` block is part of the value, so its variables are still replaced.
+A `${VAR}` in a value or a key is replaced from the environment. The file is parsed first, with each variable held by a marker of letters and digits, and the markers left in scalars are then filled in, so comments are never expanded and a value with `#`, quotes or newlines cannot change the structure of the file. A missing variable is an error that names it.
 
 The same file may also contain `providers`, `routes`, `budgets`, `keys`, `prices` and `settings`. At start, transponder upserts those into SQL and marks them `source: file`. Items marked that way show up in the admin API like any other but cannot be changed or deleted there (409 `managed_by_file`), so a GitOps setup and the console never fight over the same item. Items created through the API are `source: api`. Removing an item from the file and restarting deletes it. A user who never writes YAML never sees any of this.
 
@@ -407,8 +412,10 @@ Spend rows are kept for every user, team and key, budgeted or not, so adding a b
 
 - `transponder --config transponder.yaml`. With no `--config` it starts with defaults: SQLite in the working directory, `:8080`, a generated secrets key and a one-time admin key printed to stderr.
 - `/healthz` is always 200 while the process runs. `/readyz` checks the store and, when OIDC is configured, that the JWKS has been fetched. Providers are left out of readiness on purpose: one provider down is what fallback is for.
-- `/metrics`: `transponder_requests_total{endpoint,route,provider,model,status}`, `transponder_tokens_total{direction,provider,model}`, `transponder_cost_usd_total{provider,model}`, `transponder_upstream_duration_seconds{provider,model}`, `transponder_fallbacks_total{route,from,to,reason}`, `transponder_budget_rejections_total{subject_kind}`, `transponder_unpriced_requests_total`, `transponder_config_reloads_total{result}`. No user label, to keep cardinality bounded; per-user numbers live in SQL.
-- Tracing over OTLP when `otel.endpoint` is set: one span per request, one child span per upstream attempt, with provider, model, tokens and cost as attributes.
+- `/metrics`, in the Prometheus text format, written by a small registry in `internal/telemetry` with no dependency. The five shared names of the contract carry its labels plus transponder's own: `transponder_requests_total{endpoint,route,provider,model,code}`, `transponder_request_duration_seconds{endpoint,route}`, `transponder_inflight_requests`, `transponder_limited_total{reason}` and `transponder_events_dropped_total{sink}`. Next to them: `transponder_tokens_total{direction,provider,model}`, `transponder_cost_usd_total{provider,model}`, `transponder_upstream_duration_seconds{provider,model}`, `transponder_fallbacks_total{route,from,to,reason}`, `transponder_unpriced_requests_total`, `transponder_config_reloads_total{result}` and `transponder_build_info{version}`. Budget refusals are `transponder_limited_total{reason="budget_exceeded"}`.
+- Labels are bounded. There is no user, team, key or request id label; per-user numbers live in SQL. Routes, providers and configured models come from the config. A model name the caller chose (a wildcard route whose target sets no model) becomes a label only once a provider has answered for it, for at most 200 names, and is `other` until then. Each metric is capped at 5,000 series, with the overflow counted in one series.
+- On the gateway's port `/metrics` needs the `viewer` role, since that port faces callers and the metrics name providers, models and routes and total the spend. `ops_listen_addr` serves `/healthz`, `/readyz` and `/metrics` on a second port for a private network, where `/metrics` is open.
+- Tracing over OTLP when `otel.endpoint` is set: one span per request, one child span per upstream attempt, with provider, model, status, tokens and cost as attributes, named after the OpenTelemetry HTTP and GenAI conventions where they have a name. Spans hold no prompt, completion or provider error text, and only calls from a signed-in caller are exported. A `traceparent` from the caller is joined and its sampled flag followed; `otel.sample_ratio` samples traces that start here. The provider is sent the attempt's span as `traceparent`, and `tracestate` unchanged. The tracer and its exporter are in `internal/telemetry` with no dependency: spans go out as OTLP/HTTP with JSON bodies, in batches of up to 512 every 5 seconds from a queue of 2,048, and a span that does not fit or that the collector refuses is dropped and counted in `transponder_events_dropped_total{sink="otlp"}`. OTLP over gRPC is left out, since it would bring gRPC and protobuf into the build.
 - Logs: JSON on stdout through `log/slog`, one line per request with id, user, project, route, provider, model, tokens, cost, status, latency and fallbacks. Prompts and completions are never logged.
 - `GET /v1/models` lists the literal route names the caller may use and, for admins, direct `provider/model` entries, so tools such as Open WebUI can show a model picker.
 - `POST /v1/messages/count_tokens` is forwarded to the first Anthropic target of the route, and returns 404 when the route has none.
@@ -457,7 +464,7 @@ Settled on 2026-11-04, after the spec review:
 - Unpriced models are served at zero cost, logged as `unpriced` and counted in a metric.
 - Budget rejections use 402.
 - Every runtime and usage table has an `org_id` column, `default` in v1, and every query filters by it, as the contract requires. Organisation endpoints and org admins ship in the release after v1.
-- After v1, in this order: the OpenAI Responses API (Codex CLI uses it), organisations, Bedrock and Vertex adapters, exact-match caching, `LISTEN/NOTIFY` reload.
+- After v1, in this order: the OpenAI Responses API (Codex CLI uses it; `POST /v1/responses` shipped in v0.3.0 as a passthrough to OpenAI-dialect targets, with translation still to come), organisations, Bedrock and Vertex adapters, exact-match caching, `LISTEN/NOTIFY` reload.
 
 ## 15. Release plan
 
