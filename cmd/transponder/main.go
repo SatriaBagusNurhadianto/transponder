@@ -7,13 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +26,7 @@ import (
 	"github.com/raven-clown/transponder/internal/server"
 	"github.com/raven-clown/transponder/internal/store"
 	"github.com/raven-clown/transponder/internal/store/sqlite"
+	"github.com/raven-clown/transponder/internal/telemetry"
 )
 
 var version = "dev"
@@ -122,11 +121,10 @@ func serve(ctx context.Context, cfg *config.Bootstrap, ln net.Listener, stdout, 
 	if cfg.Store.Postgres != "" {
 		return errors.New("postgres store is not supported yet")
 	}
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(strings.ToUpper(cfg.LogLevel))); err != nil {
-		level = slog.LevelInfo
+	logger, err := telemetry.NewLogger(stdout, cfg.LogLevel)
+	if err != nil {
+		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: level}))
 
 	db, err := sqlite.Open(ctx, cfg.Store.SQLite)
 	if err != nil {

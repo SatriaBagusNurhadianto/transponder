@@ -8,6 +8,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 - `--config-test` flag to validate a configuration file, environment variables, provider routes and settings without starting the server, binding listening ports, or creating a database file (#103).
 - Every response carries `X-Request-ID`: the caller's value when it is 1 to 128 printable ASCII characters, or a new 32-character hex id. The same id is recorded with usage and sent to the provider.
+- Every line the JSON logger writes carries `"service":"transponder"`, so logs from the four projects can be told apart in one place.
 
 ## [0.2.4] - 2026-11-14
 
