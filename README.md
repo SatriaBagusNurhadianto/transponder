@@ -13,12 +13,13 @@
 
 </div>
 
-An LLM gateway that knows who is spending what. One Go binary in front of Anthropic, OpenAI, Gemini, xAI (Grok), Vercel AI Gateway, Mistral AI and Ollama, with fallback across providers, cost per user from your own identity provider, and budgets that hold across replicas. Every feature is free.
+An LLM gateway that knows who is spending what. One Go binary in front of Anthropic, OpenAI, Gemini, xAI (Grok), Vercel AI Gateway, Mistral AI, NVIDIA NIM and Ollama, with fallback across providers, cost per user from your own identity provider, and budgets that hold across replicas. Every feature is free.
 
 > **Status: early, [v0.2.4](https://github.com/raven-clown/transponder/releases/tag/v0.2.4).** Releases up to v0.2.4 are out: the binary starts with no config, prints an admin key, and serves chat completions (plain and streamed), embeddings and a model list from OpenAI, Ollama, OpenRouter, LiteLLM, Cloudflare AI Gateway or any OpenAI-compatible server, with token counts and cost on every response. Claude Code works through `/v1/messages`, and Anthropic and Gemini are providers. Budgets, token limits and request limits are in, and a route falls back to its next provider when one fails. Sign-in with OIDC and the admin API come next. The design is settled in [docs/design.md](docs/design.md) and the work is tracked in [issues](https://github.com/raven-clown/transponder/issues). Star or watch the repository to follow along, and see [How to help](#how-to-help) if you want to build it with us.
 > xAI (Grok) support is unreleased.
 > Vercel AI Gateway support is unreleased.
 > Mistral AI support is unreleased.
+> NVIDIA NIM support is unreleased.
 
 ## How it works
 
@@ -31,7 +32,7 @@ An LLM gateway that knows who is spending what. One Go binary in front of Anthro
 
 - Speaks the OpenAI API (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) and the Anthropic API (`/v1/messages`), so the OpenAI and Anthropic SDKs, Claude Code and most tools work with only a base URL change.
 - Serves `/healthz` (the process is up) and `/readyz` (the store answers) without an API key, for liveness and readiness probes.
-- Sends each call to Anthropic, OpenAI, Gemini, xAI (Grok), Vercel AI Gateway, Mistral AI or Ollama, and to any OpenAI-compatible server such as vLLM, [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) or LM Studio.
+- Sends each call to Anthropic, OpenAI, Gemini, xAI (Grok), Vercel AI Gateway, Mistral AI, NVIDIA NIM or Ollama, and to any OpenAI-compatible server such as vLLM, [llama.cpp server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) or LM Studio.
 - Falls back to the next provider when one is down, rate limited or out of credit, and skips a provider that keeps failing for a while.
 - Knows the caller from an OIDC token (Okta, Entra, Keycloak, Zitadel, Google, Auth0 and others) or an API key, and records tokens and cost in USD for every call.
 - Puts a daily or monthly budget on a user, a team or a key, and stops the calls once it is spent.
@@ -137,6 +138,9 @@ providers:
   - name: vllm
     type: vllm            # http://localhost:8000/v1 unless base_url is set
   - name: llamacpp
+  - name: nvidia
+    type: nvidia          # https://integrate.api.nvidia.com/v1 unless base_url is set. A self-hosted NIM is usually http://localhost:8000/v1
+    api_key: ${NVIDIA_API_KEY}
     type: llamacpp        # http://localhost:8080/v1 unless base_url is set. Note: llama-server listens on :8080 by default, so set base_url (e.g. http://localhost:8081/v1) or pass --port to transponder when running on the same host
     base_url: http://localhost:8081/v1
   - name: router
@@ -160,6 +164,10 @@ routes:
     targets:
       - provider: claude
   - match: "gemini-*"
+  - match: "nvidia-llama"
+    targets:
+      - provider: nvidia
+        model: meta/llama-3.1-8b-instruct
     targets:
       - provider: gemini
   - match: "gpt-*"

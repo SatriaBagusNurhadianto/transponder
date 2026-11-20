@@ -200,6 +200,36 @@ routes:
 	}
 }
 
+func TestLoadNvidia(t *testing.T) {
+	p := writeFile(t, `providers:
+  - name: nvidia
+    type: nvidia
+    api_key: ${NVIDIA_API_KEY}
+  - name: custom
+    type: nvidia
+    api_key: ${NVIDIA_API_KEY}
+    base_url: https://gateway.example/v1
+routes:
+  - match: "nvidia-*"
+    targets:
+      - provider: nvidia
+  - match: "custom/*"
+    targets:
+      - provider: custom
+`)
+	c, err := Load(p, []string{"NVIDIA_API_KEY=k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Provider{
+		{Name: "nvidia", Type: "nvidia", APIKey: "k"},
+		{Name: "custom", Type: "nvidia", BaseURL: "https://gateway.example/v1", APIKey: "k"},
+	}
+	if !reflect.DeepEqual(c.Providers, want) {
+		t.Fatalf("providers = %+v", c.Providers)
+	}
+}
+
 func TestLoadXAI(t *testing.T) {
 	p := writeFile(t, `providers:
   - name: xai

@@ -270,6 +270,14 @@ func TestBuildRouter(t *testing.T) {
 			},
 			model: "m", provider: "mistral", typ: "mistral", upstream: "m",
 		},
+		{
+			name: "nvidia route",
+			cfg: config.Bootstrap{
+				Providers: []config.Provider{{Name: "nvidia", Type: "nvidia", APIKey: "k"}},
+				Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "nvidia"}}}},
+			},
+			model: "m", provider: "nvidia", typ: "nvidia", upstream: "m",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -415,6 +423,42 @@ func TestBuildRouterMistralBaseURLOverride(t *testing.T) {
 	cfg := &config.Bootstrap{
 		Providers: []config.Provider{{Name: "mistral", Type: "mistral", BaseURL: custom, APIKey: "k"}},
 		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "mistral"}}}},
+	}
+	r, err := buildRouter(cfg, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.Resolve("m")
+	a, ok := got.Provider.(interface{ BaseURL() string })
+	if !ok || a.BaseURL() != custom {
+		t.Fatalf("provider %T", got.Provider)
+	}
+}
+
+func TestBuildRouterNvidiaDefault(t *testing.T) {
+	cfg := &config.Bootstrap{
+		Providers: []config.Provider{{Name: "nvidia", Type: "nvidia", APIKey: "k"}},
+		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "nvidia"}}}},
+	}
+	r, err := buildRouter(cfg, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.Resolve("m")
+	a, ok := got.Provider.(interface{ BaseURL() string })
+	if !ok {
+		t.Fatalf("provider %T", got.Provider)
+	}
+	if a.BaseURL() != "https://integrate.api.nvidia.com/v1" || got.Free {
+		t.Fatalf("base %q free=%v", a.BaseURL(), got.Free)
+	}
+}
+
+func TestBuildRouterNvidiaBaseURLOverride(t *testing.T) {
+	const custom = "https://gateway.example/v1"
+	cfg := &config.Bootstrap{
+		Providers: []config.Provider{{Name: "nvidia", Type: "nvidia", BaseURL: custom, APIKey: "k"}},
+		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "nvidia"}}}},
 	}
 	r, err := buildRouter(cfg, http.DefaultClient)
 	if err != nil {
