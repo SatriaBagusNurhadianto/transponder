@@ -230,6 +230,36 @@ routes:
 	}
 }
 
+func TestLoadGroq(t *testing.T) {
+	p := writeFile(t, `providers:
+  - name: groq
+    type: groq
+    api_key: ${GROQ_API_KEY}
+  - name: custom
+    type: groq
+    api_key: ${GROQ_API_KEY}
+    base_url: https://gateway.example/openai/v1
+routes:
+  - match: "groq-*"
+    targets:
+      - provider: groq
+  - match: "custom/*"
+    targets:
+      - provider: custom
+`)
+	c, err := Load(p, []string{"GROQ_API_KEY=k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Provider{
+		{Name: "groq", Type: "groq", APIKey: "k"},
+		{Name: "custom", Type: "groq", BaseURL: "https://gateway.example/openai/v1", APIKey: "k"},
+	}
+	if !reflect.DeepEqual(c.Providers, want) {
+		t.Fatalf("providers = %+v", c.Providers)
+	}
+}
+
 func TestLoadXAI(t *testing.T) {
 	p := writeFile(t, `providers:
   - name: xai

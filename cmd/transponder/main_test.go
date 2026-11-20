@@ -278,6 +278,14 @@ func TestBuildRouter(t *testing.T) {
 			},
 			model: "m", provider: "nvidia", typ: "nvidia", upstream: "m",
 		},
+		{
+			name: "groq route",
+			cfg: config.Bootstrap{
+				Providers: []config.Provider{{Name: "groq", Type: "groq", APIKey: "k"}},
+				Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "groq"}}}},
+			},
+			model: "m", provider: "groq", typ: "groq", upstream: "m",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -459,6 +467,42 @@ func TestBuildRouterNvidiaBaseURLOverride(t *testing.T) {
 	cfg := &config.Bootstrap{
 		Providers: []config.Provider{{Name: "nvidia", Type: "nvidia", BaseURL: custom, APIKey: "k"}},
 		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "nvidia"}}}},
+	}
+	r, err := buildRouter(cfg, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.Resolve("m")
+	a, ok := got.Provider.(interface{ BaseURL() string })
+	if !ok || a.BaseURL() != custom {
+		t.Fatalf("provider %T", got.Provider)
+	}
+}
+
+func TestBuildRouterGroqDefault(t *testing.T) {
+	cfg := &config.Bootstrap{
+		Providers: []config.Provider{{Name: "groq", Type: "groq", APIKey: "k"}},
+		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "groq"}}}},
+	}
+	r, err := buildRouter(cfg, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.Resolve("m")
+	a, ok := got.Provider.(interface{ BaseURL() string })
+	if !ok {
+		t.Fatalf("provider %T", got.Provider)
+	}
+	if a.BaseURL() != "https://api.groq.com/openai/v1" || got.Free {
+		t.Fatalf("base %q free=%v", a.BaseURL(), got.Free)
+	}
+}
+
+func TestBuildRouterGroqBaseURLOverride(t *testing.T) {
+	const custom = "https://gateway.example/openai/v1"
+	cfg := &config.Bootstrap{
+		Providers: []config.Provider{{Name: "groq", Type: "groq", BaseURL: custom, APIKey: "k"}},
+		Routes:    []config.Route{{Match: "*", Targets: []config.Target{{Provider: "groq"}}}},
 	}
 	r, err := buildRouter(cfg, http.DefaultClient)
 	if err != nil {
