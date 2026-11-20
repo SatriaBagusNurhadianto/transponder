@@ -56,13 +56,13 @@ func New(d Deps) http.Handler {
 	mux.Handle("/healthz", Healthz())
 	mux.Handle("/readyz", Readyz(d.Ready))
 	if d.RequestTimeout <= 0 {
-		return mux
+		return RequestID(mux)
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), d.RequestTimeout)
 		defer cancel()
 		mux.ServeHTTP(w, r.WithContext(ctx))
-	})
+	}))
 }
 
 type gateway struct {
