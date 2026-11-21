@@ -73,7 +73,7 @@ func ReadChunk(data []byte) (text string, u schema.Usage, ok, usageOnly bool) {
 	var w struct {
 		Choices []struct {
 			Delta struct {
-				Content json.RawMessage `json:"content"`
+				Content chunkContent `json:"content"`
 			} `json:"delta"`
 		} `json:"choices"`
 		Usage *wireUsageIn `json:"usage"`
@@ -83,14 +83,17 @@ func ReadChunk(data []byte) (text string, u schema.Usage, ok, usageOnly bool) {
 		u, ok, usageOnly = ChunkUsage(data)
 		return "", u, ok, usageOnly
 	}
-	var b strings.Builder
-	for _, ch := range w.Choices {
-		s, err := messageText(ch.Delta.Content)
-		if err == nil {
-			b.WriteString(s)
+	switch len(w.Choices) {
+	case 0:
+	case 1:
+		text = string(w.Choices[0].Delta.Content)
+	default:
+		var b strings.Builder
+		for _, ch := range w.Choices {
+			b.WriteString(string(ch.Delta.Content))
 		}
+		text = b.String()
 	}
-	text = b.String()
 	if w.Usage == nil {
 		return text, schema.Usage{}, false, false
 	}

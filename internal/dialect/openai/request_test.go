@@ -111,6 +111,29 @@ func TestChunkDecoderContentParts(t *testing.T) {
 	}
 }
 
+func TestChunkContentStringShapes(t *testing.T) {
+	tests := []struct {
+		name, content, want string
+	}{
+		{"plain", `"hi"`, "hi"},
+		{"escaped quote and newline", `"a\"b\nc"`, "a\"b\nc"},
+		{"unicode escape", `"é"`, "é"},
+		{"null", `null`, ""},
+		{"empty", `""`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c chunkContent
+			if err := json.Unmarshal([]byte(tt.content), &c); err != nil {
+				t.Fatal(err)
+			}
+			if string(c) != tt.want {
+				t.Fatalf("content %q, want %q", c, tt.want)
+			}
+		})
+	}
+}
+
 func TestChunkDecoder(t *testing.T) {
 	chunks := []string{
 		`{"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`,
