@@ -4,6 +4,10 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Changed
+
+- When every target of a route is rate limiting, answering 429 or Anthropic's 529, the caller gets 429 `upstream_rate_limited` with a `Retry-After` taken from the shortest wait the providers asked for, bounded to an hour, and one second when none gave one. It used to be a 502 `upstream_error`, which SDKs and Claude Code treat as a broken server and retry at once. The 502 for a route that mixed a rate limit with another failure no longer says no provider answered.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added
