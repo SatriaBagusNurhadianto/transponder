@@ -158,8 +158,8 @@ func (d *ChunkDecoder) toolIndex(tc wireToolCall) int {
 type wireChunkIn struct {
 	Choices []struct {
 		Delta struct {
-			Content   *string        `json:"content"`
-			ToolCalls []wireToolCall `json:"tool_calls"`
+			Content   json.RawMessage `json:"content"`
+			ToolCalls []wireToolCall  `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -178,8 +178,12 @@ func (d *ChunkDecoder) Events(data []byte) ([]schema.Event, error) {
 		out = append(out, schema.Event{Type: schema.EventStart})
 	}
 	for _, ch := range c.Choices {
-		if ch.Delta.Content != nil && *ch.Delta.Content != "" {
-			out = append(out, schema.Event{Type: schema.EventText, Text: *ch.Delta.Content})
+		text, err := messageText(ch.Delta.Content)
+		if err != nil {
+			return nil, err
+		}
+		if text != "" {
+			out = append(out, schema.Event{Type: schema.EventText, Text: text})
 		}
 		for _, tc := range ch.Delta.ToolCalls {
 			i := d.toolIndex(tc)
